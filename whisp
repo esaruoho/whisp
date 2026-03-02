@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="turbo"
+LANGUAGE=""
+OUTPUT_DIR=""
+CONDITION_ON_PREV="False"
+HALLUC_SILENCE_THRESH="2"
+NO_MERGE="false"
+FILES=()
+URLS=()
+
+is_youtube_url() {
+  [[ "$1" =~ ^https?://(www\.)?(youtube\.com/(watch|playlist)|youtu\.be/) ]]
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: whisp [OPTIONS] [FILE...] [YOUTUBE_URL...]
+
+Transcribe audio/video files using OpenAI Whisper, optionally merging
+with YouTube captions for better proper-noun accuracy.
+
+Options:
+  --en               Force English
+  --fi               Force Finnish
+  --de               Force German
+  --ru               Force Russian
+  --sv               Force Swedish
+  --model NAME       Whisper model (default: turbo)
+  --out DIR          Output directory (default: current directory)
+  --condition-prev   Enable conditioning on previous text (off by default
+                     to prevent "thank you"/"yes" hallucination loops)
+  --no-halluc-filter Disable hallucination silence filter
+  --no-merge         Skip YouTube caption merge step
+  -h, --help         Show this help
+
+Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov
+
+Examples:
+  whisp recording.mp3
+  whisp --en interview.m4a
+  whisp --fi lecture.mp4
+  whisp --de presentation.ogg
+
+  # Local file + YouTube URL: Whisper + captions merged
+  whisp video.mp4 https://www.youtube.com/watch?v=ABC123
+
+  # URL only: download audio, transcribe, merge with captions
+  whisp https://www.youtube.com/watch?v=ABC123
+  whisp --en https://youtu.be/ABC123
+USAGE
+  exit 0
+}
+
+# --- Auto-install dependencies ---
+
+install_prompt() {
+  local pkg="$1"
+  local install_cmd="$2"
+  echo ""
+  echo "Missing dependency: $pkg"
+  echo "Install command:    $install_cmd"
+  read -rp "Install now? [Y/n] " answer
+  case "${answer:-Y}" in
+    [Yy]*) eval "$install_cmd" ;;
+    *)     echo "Aborted. Install '$pkg' manually and re-run." >&2; exit 1 ;;
+  esac
+}
+
+ensure_ffmpeg() {
+  command -v ffmpeg &>/dev/null && return
+  if command -v brew &>/dev/null; then
+    install_prompt "ffmpeg" "brew install ffmpeg"
+  elif command -v apt-get &>/dev/null; then
+    install_prompt "ffmpeg" "sudo apt-get update && sudo apt-get install -y ffmpeg"
+  else
+    echo "Error: ffmpeg not found and no supported package manager detected." >&2
+    echo "Install ffmpeg manually: https://ffmpeg.org/download.html" >&2
+    exit 1
+  fi
+}
+
+ensure_whisper() {
+  command -v whisper &>/dev/null && return
+  install_prompt "openai-whisper" "pip install -U openai-whisper"
+  if ! command -v whisper &>/dev/null; then
+    echo "Error: whisper still not found after install. Check your Python/pip setup." >&2
+    exit 1
+  fi
+}
+
+ensure_ytdlp() {
+  command -v yt-dlp &>/dev/null && return
+  install_prompt "yt-dlp" "pip install -U yt-dlp"
+  if ! command -v yt-dlp &>/dev/null; then
+    echo "Error: yt-dlp still not found after install. Check your Python/pip setup." >&2
+    exit 1
+  fi
+}
+
+# --- Argument parsing ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --en)               LANGUAGE="en"; shift ;;
+    --fi)               LANGUAGE="fi"; shift ;;
+    --de)               LANGUAGE="de"; shift ;;
+    --ru)               LANGUAGE="ru"; shift ;;
+    --sv)               LANGUAGE="sv"; shift ;;
+    --model)            MODEL="$2"; shift 2 ;;
+    --out)              OUTPUT_DIR="$2"; shift 2 ;;
+    --condition-prev)   CONDITION_ON_PREV="True"; shift ;;
+    --no-halluc-filter) HALLUC_SILENCE_THRESH="0"; shift ;;
+    --no-merge)         NO_MERGE="true"; shift ;;
+    -h|--help) usage ;;
+    -*)        echo "Unknown option: $1" >&2; exit 1 ;;
+    *)
+      if is_youtube_url "$1"; then
+        URLS+=("$1")
+      else
+        FILES+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#FILES[@]} -eq 0 && ${#URLS[@]} -eq 0 ]]; then
+  echo "Error: No input files or URLs specified." >&2
+  echo "Run 'whisp --help' for usage." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Dependency checks (auto-install if missing)
+ensure_ffmpeg
+ensure_whisper
+
+if [[ ${#URLS[@]} -gt 0 ]]; then
+  ensure_ytdlp
+fi
+
+# Determine subtitle language code
+SUB_LANG="${LANGUAGE:-en}"
+
+# Validate file+URL pairing
+if [[ ${#FILES[@]} -gt 0 && ${#URLS[@]} -gt 0 ]]; then
+  if [[ ${#FILES[@]} -ne ${#URLS[@]} ]]; then
+    echo "Error: File/URL count mismatch: ${#FILES[@]} file(s) and ${#URLS[@]} URL(s)." >&2
+    echo "  Provide one URL per file, or URLs only (audio will be downloaded)." >&2
+    exit 1
+  fi
+fi
+
+# If URLs only (no local files), download audio first
+if [[ ${#FILES[@]} -eq 0 && ${#URLS[@]} -gt 0 ]]; then
+  if [[ -n "$OUTPUT_DIR" ]]; then
+    dl_dir="$OUTPUT_DIR"
+  else
+    dl_dir="$(pwd)"
+  fi
+  mkdir -p "$dl_dir"
+
+  for url in "${URLS[@]}"; do
+    echo "=== Downloading audio: $url ==="
+    # Get video title for readable filename
+    video_title=$(yt-dlp --print "%(title)s" "$url" 2>/dev/null | \
+      tr '/:*?"<>|\\' '-' | sed 's/  */ /g; s/^ *//; s/ *$//')
+    video_id=$(yt-dlp --print id "$url" 2>/dev/null)
+    if [[ -z "$video_title" ]]; then
+      video_title="$video_id"
+    fi
+    yt-dlp -f bestaudio --extract-audio --audio-format m4a \
+      -o "$dl_dir/${video_title}.%(ext)s" "$url"
+    dl_file="$dl_dir/${video_title}.m4a"
+    if [[ ! -f "$dl_file" ]]; then
+      # Fallback: try with video ID
+      yt-dlp -f bestaudio --extract-audio --audio-format m4a \
+        -o "$dl_dir/${video_id}.%(ext)s" "$url" 2>/dev/null || true
+      dl_file="$dl_dir/${video_id}.m4a"
+    fi
+    if [[ ! -f "$dl_file" ]]; then
+      echo "Error: Downloaded audio not found" >&2
+      exit 1
+    fi
+    FILES+=("$dl_file")
+    echo "    Downloaded: $dl_file"
+    echo ""
+  done
+fi
+
+SUPPORTED_EXTENSIONS="mp3|m4a|ogg|wav|flac|mp4|mkv|webm|avi|mov"
+
+for idx in "${!FILES[@]}"; do
+  file="${FILES[$idx]}"
+  # Determine paired URL (if any)
+  paired_url=""
+  if [[ ${#URLS[@]} -gt 0 && $idx -lt ${#URLS[@]} ]]; then
+    paired_url="${URLS[$idx]}"
+  fi
+
+  if [[ ! -f "$file" ]]; then
+    echo "Error: File not found: $file" >&2
+    continue
+  fi
+
+  ext="${file##*.}"
+  ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+  if [[ ! "$ext" =~ ^($SUPPORTED_EXTENSIONS)$ ]]; then
+    echo "Error: Unsupported file type: .$ext ($file)" >&2
+    echo "  Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov" >&2
+    continue
+  fi
+
+  if [[ -n "$OUTPUT_DIR" ]]; then
+    outdir="$OUTPUT_DIR"
+  else
+    outdir="$(pwd)"
+  fi
+  mkdir -p "$outdir"
+
+  echo "=== Transcribing: $file ==="
+  echo "    Model: $MODEL"
+  if [[ -n "$LANGUAGE" ]]; then
+    echo "    Language: $LANGUAGE"
+  else
+    echo "    Language: auto-detect"
+  fi
+  echo "    Output: $outdir"
+  echo "    Condition on previous text: $CONDITION_ON_PREV"
+  if [[ "$HALLUC_SILENCE_THRESH" != "0" ]]; then
+    echo "    Hallucination silence threshold: ${HALLUC_SILENCE_THRESH}s"
+  fi
+  if [[ -n "$paired_url" ]]; then
+    echo "    YouTube URL: $paired_url"
+    echo "    Word timestamps: enabled (for merge)"
+  fi
+  echo ""
+
+  WHISPER_ARGS=(
+    "$file"
+    --model "$MODEL"
+    --output_format all
+    --output_dir "$outdir"
+    --condition_on_previous_text "$CONDITION_ON_PREV"
+  )
+
+  if [[ -n "$LANGUAGE" ]]; then
+    WHISPER_ARGS+=(--language "$LANGUAGE")
+  fi
+
+  if [[ "$HALLUC_SILENCE_THRESH" != "0" ]]; then
+    WHISPER_ARGS+=(--hallucination_silence_threshold "$HALLUC_SILENCE_THRESH")
+  fi
+
+  # Enable word-level timestamps when merging with YouTube captions
+  if [[ -n "$paired_url" ]]; then
+    WHISPER_ARGS+=(--word_timestamps True)
+  fi
+
+  # Start YouTube caption download in parallel with Whisper
+  yt_captions_pid=""
+  yt_subs_dir=""
+  yt_captions_log=""
+  if [[ -n "$paired_url" && "$NO_MERGE" != "true" ]]; then
+    yt_subs_dir="$outdir/.yt-subs"
+    mkdir -p "$yt_subs_dir"
+    yt_captions_log="$yt_subs_dir/.download.log"
+
+    echo "--- YouTube captions: downloading in background ---"
+    (
+      video_id=$(yt-dlp --print id "$paired_url" 2>/dev/null)
+      echo "$video_id" > "$yt_subs_dir/.video_id"
+
+      # Try manual captions first, then auto-generated
+      for sub_flag in --write-subs --write-auto-subs; do
+        yt-dlp "$sub_flag" --sub-langs "$SUB_LANG" --sub-format vtt \
+          --skip-download -o "$yt_subs_dir/%(id)s" "$paired_url" 2>/dev/null || true
+        vtt_file="$yt_subs_dir/${video_id}.${SUB_LANG}.vtt"
+        if [[ -f "$vtt_file" ]]; then
+          echo "OK $sub_flag $vtt_file" > "$yt_captions_log"
+          exit 0
+        fi
+      done
+
+      # Fallback: find any VTT that was downloaded
+      vtt_file=$(find "$yt_subs_dir" -name "${video_id}*.vtt" -print -quit 2>/dev/null || true)
+      if [[ -n "$vtt_file" && -f "$vtt_file" ]]; then
+        echo "OK fallback $vtt_file" > "$yt_captions_log"
+      else
+        echo "FAIL" > "$yt_captions_log"
+      fi
+    ) &
+    yt_captions_pid=$!
+    echo "    Caption download PID: $yt_captions_pid"
+    echo ""
+  fi
+
+  if ! whisper "${WHISPER_ARGS[@]}"; then
+    echo "Error: Whisper failed to transcribe: $file" >&2
+    # Clean up background job if running
+    if [[ -n "$yt_captions_pid" ]]; then
+      kill "$yt_captions_pid" 2>/dev/null || true
+      wait "$yt_captions_pid" 2>/dev/null || true
+    fi
+    continue
+  fi
+
+  basename="${file##*/}"
+  basename="${basename%.*}"
+
+  # Post-process: strip hallucination loops (3+ consecutive identical segments)
+  json_out="$outdir/$basename.json"
+  if [[ -f "$json_out" ]]; then
+    echo ""
+    echo "--- Deloop: checking for hallucination loops ---"
+    python3 "$SCRIPT_DIR/whisp-deloop" "$basename" "$outdir"
+  else
+    echo ""
+    echo "Warning: No JSON output found, skipping deloop." >&2
+  fi
+
+  # YouTube caption merge step — wait for background download to finish
+  if [[ -n "$yt_captions_pid" ]]; then
+    echo ""
+    echo "--- YouTube captions: waiting for download to finish ---"
+    wait "$yt_captions_pid" 2>/dev/null || true
+
+    if [[ -f "$yt_captions_log" ]]; then
+      yt_result=$(cat "$yt_captions_log")
+      if [[ "$yt_result" == FAIL ]]; then
+        echo "    Warning: No captions found for $paired_url, skipping merge." >&2
+      else
+        # Extract vtt_file path (third field)
+        vtt_file=$(echo "$yt_result" | awk '{print $3}')
+        sub_flag=$(echo "$yt_result" | awk '{print $2}')
+        echo "    Captions ($sub_flag): $vtt_file"
+        if [[ -n "$vtt_file" && -f "$vtt_file" ]]; then
+          echo ""
+          echo "--- Merge: combining Whisper + YouTube captions ---"
+          python3 "$SCRIPT_DIR/whisp-merge" "$basename" "$outdir" "$vtt_file"
+        else
+          echo "    Warning: Caption file not found, skipping merge." >&2
+        fi
+      fi
+      rm -f "$yt_captions_log"
+    else
+      echo "    Warning: Caption download produced no result, skipping merge." >&2
+    fi
+  fi
+
+  echo ""
+  echo "Done: $file"
+  echo "Output files:"
+  for ext in txt srt vtt tsv json; do
+    target="$outdir/$basename.$ext"
+    if [[ -f "$target" ]]; then
+      echo "  $target"
+    fi
+  done
+  echo ""
+done
+
+echo "All done."

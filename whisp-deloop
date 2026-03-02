@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Post-processor for Whisper output: removes hallucinated repetition loops.
+
+Reads the Whisper JSON output, detects consecutive repeated segments
+(e.g. "Thank you" x20), strips them, and regenerates clean output files.
+
+Usage: whisp-deloop <basename> <output_dir>
+"""
+
+import json
+import sys
+import os
+import re
+
+
+def normalize(text):
+    """Normalize text for comparison (lowercase, strip punctuation/whitespace)."""
+    return re.sub(r'[^a-z0-9 ]', '', text.lower()).strip()
+
+
+def detect_and_remove_loops(segments, threshold=3):
+    """Remove consecutive runs of repeated segments (threshold or more)."""
+    if not segments:
+        return segments
+
+    clean = []
+    i = 0
+    removed_ranges = []
+
+    while i < len(segments):
+        norm_i = normalize(segments[i].get('text', ''))
+
+        # Look ahead for consecutive repeats
+        j = i + 1
+        while j < len(segments) and normalize(segments[j].get('text', '')) == norm_i:
+            j += 1
+
+        run_length = j - i
+
+        if run_length >= threshold and norm_i:
+            # This is a hallucination loop — skip all but keep note
+            start_ts = segments[i].get('start', 0)
+            end_ts = segments[j - 1].get('end', 0)
+            removed_ranges.append({
+                'text': segments[i].get('text', '').strip(),
+                'count': run_length,
+                'start': start_ts,
+                'end': end_ts,
+            })
+            i = j  # skip entire run
+        else:
+            clean.append(segments[i])
+            i += 1
+
+    return clean, removed_ranges
+
+
+def format_ts_srt(seconds):
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def format_ts_vtt(seconds):
+    """Format seconds as VTT timestamp: HH:MM:SS.mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def write_txt(segments, path):
+    with open(path, 'w') as f:
+        for seg in segments:
+            f.write(seg.get('text', '').strip() + '\n')
+
+
+def write_srt(segments, path):
+    with open(path, 'w') as f:
+        for i, seg in enumerate(segments, 1):
+            start = format_ts_srt(seg['start'])
+            end = format_ts_srt(seg['end'])
+            text = seg.get('text', '').strip()
+            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+
+
+def write_vtt(segments, path):
+    with open(path, 'w') as f:
+        f.write("WEBVTT\n\n")
+        for seg in segments:
+            start = format_ts_vtt(seg['start'])
+            end = format_ts_vtt(seg['end'])
+            text = seg.get('text', '').strip()
+            f.write(f"{start} --> {end}\n{text}\n\n")
+
+
+def write_tsv(segments, path):
+    with open(path, 'w') as f:
+        f.write("start\tend\ttext\n")
+        for seg in segments:
+            start = int(seg['start'] * 1000)
+            end = int(seg['end'] * 1000)
+            text = seg.get('text', '').strip()
+            f.write(f"{start}\t{end}\t{text}\n")
+
+
+def write_json(data, segments, path):
+    data['segments'] = segments
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <basename> <output_dir>", file=sys.stderr)
+        sys.exit(1)
+
+    basename = sys.argv[1]
+    output_dir = sys.argv[2]
+    json_path = os.path.join(output_dir, basename + '.json')
+
+    if not os.path.exists(json_path):
+        print(f"Error: {json_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    segments = data.get('segments', [])
+    original_count = len(segments)
+
+    clean_segments, removed = detect_and_remove_loops(segments, threshold=3)
+
+    if not removed:
+        print("  No hallucination loops detected.")
+        return
+
+    for r in removed:
+        print(f"  Removed {r['count']}x \"{r['text']}\" "
+              f"({format_ts_vtt(r['start'])} -> {format_ts_vtt(r['end'])})")
+
+    print(f"  Segments: {original_count} -> {len(clean_segments)} "
+          f"({original_count - len(clean_segments)} removed)")
+
+    # Regenerate all output files
+    write_json(data, clean_segments, os.path.join(output_dir, basename + '.json'))
+    write_txt(clean_segments, os.path.join(output_dir, basename + '.txt'))
+    write_srt(clean_segments, os.path.join(output_dir, basename + '.srt'))
+    write_vtt(clean_segments, os.path.join(output_dir, basename + '.vtt'))
+    write_tsv(clean_segments, os.path.join(output_dir, basename + '.tsv'))
+
+    print("  Output files regenerated.")
+
+
+if __name__ == '__main__':
+    main()
