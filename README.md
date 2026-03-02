@@ -26,14 +26,17 @@ whisp will **auto-install missing dependencies** on first run (prompts before in
 | Dependency | What it does | Install command |
 |---|---|---|
 | [ffmpeg](https://ffmpeg.org/) | Audio/video processing | `brew install ffmpeg` |
-| [openai-whisper](https://github.com/openai/whisper) | Speech-to-text | `pip install -U openai-whisper` |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | YouTube download (only needed for URL mode) | `pip install -U yt-dlp` |
+| [openai-whisper](https://github.com/openai/whisper) | Speech-to-text | `brew install openai-whisper` |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | YouTube download (only needed for URL mode) | `brew install yt-dlp` |
+
+On macOS, whisp uses Homebrew for all dependencies (avoids pip/venv issues). If Homebrew itself is missing, whisp will offer to install it too.
+
+On Linux, it falls back to `apt-get`.
 
 Or install everything upfront:
 
 ```bash
-brew install ffmpeg
-pip install -U openai-whisper yt-dlp
+brew install ffmpeg openai-whisper yt-dlp
 ```
 
 ## Usage

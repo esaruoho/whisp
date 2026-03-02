@@ -55,6 +55,11 @@ USAGE
 
 # --- Auto-install dependencies ---
 
+HAS_BREW=""
+if command -v brew &>/dev/null; then
+  HAS_BREW=1
+fi
+
 install_prompt() {
   local pkg="$1"
   local install_cmd="$2"
@@ -68,33 +73,46 @@ install_prompt() {
   esac
 }
 
-ensure_ffmpeg() {
-  command -v ffmpeg &>/dev/null && return
-  if command -v brew &>/dev/null; then
-    install_prompt "ffmpeg" "brew install ffmpeg"
+ensure_brew() {
+  [[ -n "$HAS_BREW" ]] && return
+  echo ""
+  echo "Homebrew not found. whisp uses brew to install dependencies on macOS."
+  echo "Install command:    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+  read -rp "Install Homebrew now? [Y/n] " answer
+  case "${answer:-Y}" in
+    [Yy]*)
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      # Add brew to PATH for this session (Apple Silicon vs Intel)
+      if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+      elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+      fi
+      HAS_BREW=1
+      ;;
+    *) echo "Aborted." >&2; exit 1 ;;
+  esac
+}
+
+ensure_dep() {
+  local cmd="$1"
+  local brew_pkg="$2"
+  local apt_pkg="${3:-$brew_pkg}"
+
+  command -v "$cmd" &>/dev/null && return
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    ensure_brew
+    install_prompt "$brew_pkg" "brew install $brew_pkg"
   elif command -v apt-get &>/dev/null; then
-    install_prompt "ffmpeg" "sudo apt-get update && sudo apt-get install -y ffmpeg"
+    install_prompt "$apt_pkg" "sudo apt-get update && sudo apt-get install -y $apt_pkg"
   else
-    echo "Error: ffmpeg not found and no supported package manager detected." >&2
-    echo "Install ffmpeg manually: https://ffmpeg.org/download.html" >&2
+    echo "Error: '$cmd' not found and no supported package manager detected." >&2
     exit 1
   fi
-}
 
-ensure_whisper() {
-  command -v whisper &>/dev/null && return
-  install_prompt "openai-whisper" "pip install -U openai-whisper"
-  if ! command -v whisper &>/dev/null; then
-    echo "Error: whisper still not found after install. Check your Python/pip setup." >&2
-    exit 1
-  fi
-}
-
-ensure_ytdlp() {
-  command -v yt-dlp &>/dev/null && return
-  install_prompt "yt-dlp" "pip install -U yt-dlp"
-  if ! command -v yt-dlp &>/dev/null; then
-    echo "Error: yt-dlp still not found after install. Check your Python/pip setup." >&2
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: '$cmd' still not found after install." >&2
     exit 1
   fi
 }
@@ -135,11 +153,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Dependency checks (auto-install if missing)
-ensure_ffmpeg
-ensure_whisper
+ensure_dep ffmpeg ffmpeg
+ensure_dep whisper openai-whisper
 
 if [[ ${#URLS[@]} -gt 0 ]]; then
-  ensure_ytdlp
+  ensure_dep yt-dlp yt-dlp
 fi
 
 # Determine subtitle language code
