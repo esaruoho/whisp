@@ -1,3 +1,5 @@
+.DS_Store
+*.qta
 *.txt
 *.srt
 *.vtt
