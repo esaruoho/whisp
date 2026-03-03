@@ -35,7 +35,7 @@ Options:
   --no-merge         Skip YouTube caption merge step
   -h, --help         Show this help
 
-Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov
+Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, qta (Apple spatial audio)
 
 Examples:
   whisp recording.mp3
@@ -209,7 +209,7 @@ if [[ ${#FILES[@]} -eq 0 && ${#URLS[@]} -gt 0 ]]; then
   done
 fi
 
-SUPPORTED_EXTENSIONS="mp3|m4a|ogg|wav|flac|mp4|mkv|webm|avi|mov"
+SUPPORTED_EXTENSIONS="mp3|m4a|ogg|wav|flac|mp4|mkv|webm|avi|mov|qta"
 
 for idx in "${!FILES[@]}"; do
   file="${FILES[$idx]}"
@@ -228,8 +228,24 @@ for idx in "${!FILES[@]}"; do
   ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
   if [[ ! "$ext" =~ ^($SUPPORTED_EXTENSIONS)$ ]]; then
     echo "Error: Unsupported file type: .$ext ($file)" >&2
-    echo "  Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov" >&2
+    echo "  Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, qta" >&2
     continue
+  fi
+
+  # Auto-convert .qta (Apple Spatial Audio) to .m4a by extracting the AAC stream
+  if [[ "$ext" == "qta" ]]; then
+    m4a_file="${file%.qta}.m4a"
+    if [[ ! -f "$m4a_file" ]]; then
+      echo "--- Converting .qta (spatial audio) to .m4a ---"
+      ffmpeg -y -i "$file" -map 0:0 -c copy "$m4a_file" 2>/dev/null
+      if [[ ! -f "$m4a_file" ]]; then
+        echo "Error: Failed to convert $file to m4a" >&2
+        continue
+      fi
+      echo "    Converted: $m4a_file"
+    fi
+    file="$m4a_file"
+    ext="m4a"
   fi
 
   if [[ -n "$OUTPUT_DIR" ]]; then
@@ -381,4 +397,76 @@ for idx in "${!FILES[@]}"; do
   echo ""
 done
 
+# --- Archive to whisp-transcripts repo ---
+
+TRANSCRIPTS_REPO="$HOME/work/whisp-transcripts"
+if [[ -d "$TRANSCRIPTS_REPO/.git" ]]; then
+  echo ""
+  echo "=== Archiving to whisp-transcripts ==="
+  cd "$TRANSCRIPTS_REPO"
+  git pull --rebase --autostash 2>/dev/null || true
+
+  archived=0
+  for idx in "${!FILES[@]}"; do
+    file="${FILES[$idx]}"
+    basename="${file##*/}"
+    basename="${basename%.*}"
+
+    if [[ -n "$OUTPUT_DIR" ]]; then
+      outdir="$OUTPUT_DIR"
+    else
+      outdir="$(cd "$(dirname "$file")" && pwd)"
+    fi
+
+    # Check if transcript files exist
+    txt_file="$outdir/$basename.txt"
+    [[ -f "$txt_file" ]] || continue
+
+    # Create transcript directory (same format as whisp-worker)
+    today="$(date +%Y-%m-%d)"
+    slug="$(echo "$basename" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | head -c 80)"
+    transcript_dir="$TRANSCRIPTS_REPO/transcripts/${today}_${slug}"
+    [[ -d "$transcript_dir" ]] && transcript_dir="${transcript_dir}_$(date +%s)"
+    mkdir -p "$transcript_dir"
+
+    # Copy transcript files
+    for ext in txt json srt vtt tsv; do
+      src="$outdir/$basename.$ext"
+      [[ -f "$src" ]] && cp "$src" "$transcript_dir/transcript.$ext"
+    done
+
+    # Generate metadata
+    duration_secs=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null | cut -d. -f1 || echo "0")
+    cat > "$transcript_dir/metadata.yaml" <<METAEOF
+title: "$(echo "$basename" | sed 's/"/\\"/g')"
+source_file: "$(basename "$file")"
+duration_seconds: ${duration_secs:-0}
+whisper_model: $MODEL
+language: ${LANGUAGE:-auto}
+transcribed_date: "$today"
+source: local
+
+concepts: []
+people: []
+domains: []
+METAEOF
+
+    echo "  Archived: $basename -> $(basename "$transcript_dir")"
+    ((archived++)) || true
+  done
+
+  if [[ "$archived" -gt 0 ]]; then
+    cd "$TRANSCRIPTS_REPO"
+    git add transcripts/
+    git commit -m "transcript: $archived local file(s) from $(hostname -s)"
+    git push && echo "Pushed $archived transcript(s) to repo." || echo "Push failed — will retry next time."
+  else
+    echo "  No transcripts to archive."
+  fi
+else
+  echo ""
+  echo "Note: ~/work/whisp-transcripts not found — transcripts saved locally only."
+fi
+
+echo ""
 echo "All done."
