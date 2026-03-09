@@ -35,7 +35,8 @@ Options:
   --no-merge         Skip YouTube caption merge step
   -h, --help         Show this help
 
-Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, qta (Apple spatial audio)
+Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, wmv, wma, aiff, rm, qta
+  Formats not natively supported by Whisper (wmv, wma, aiff, rm) are auto-converted via ffmpeg.
 
 Examples:
   whisp recording.mp3
@@ -209,7 +210,7 @@ if [[ ${#FILES[@]} -eq 0 && ${#URLS[@]} -gt 0 ]]; then
   done
 fi
 
-SUPPORTED_EXTENSIONS="mp3|m4a|ogg|wav|flac|mp4|mkv|webm|avi|mov|qta"
+SUPPORTED_EXTENSIONS="mp3|m4a|ogg|wav|flac|mp4|mkv|webm|avi|mov|wmv|wma|aiff|rm|qta"
 
 for idx in "${!FILES[@]}"; do
   file="${FILES[$idx]}"
@@ -228,25 +229,84 @@ for idx in "${!FILES[@]}"; do
   ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
   if [[ ! "$ext" =~ ^($SUPPORTED_EXTENSIONS)$ ]]; then
     echo "Error: Unsupported file type: .$ext ($file)" >&2
-    echo "  Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, qta" >&2
+    echo "  Supported formats: mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov, wmv, wma, aiff, rm, qta" >&2
     continue
   fi
 
-  # Auto-convert .qta (Apple Spatial Audio) to .m4a by extracting the AAC stream
-  if [[ "$ext" == "qta" ]]; then
-    m4a_file="${file%.qta}.m4a"
-    if [[ ! -f "$m4a_file" ]]; then
-      echo "--- Converting .qta (spatial audio) to .m4a ---"
-      ffmpeg -y -i "$file" -map 0:0 -c copy "$m4a_file" 2>/dev/null
+  # Auto-convert formats not natively supported by Whisper
+  # qta → m4a (stream copy), wmv/wma/aiff/rm → mp4/m4a (transcode)
+  case "$ext" in
+    qta)
+      m4a_file="${file%.qta}.m4a"
       if [[ ! -f "$m4a_file" ]]; then
-        echo "Error: Failed to convert $file to m4a" >&2
-        continue
+        echo "--- Converting .qta (spatial audio) to .m4a ---"
+        ffmpeg -y -i "$file" -map 0:0 -c copy "$m4a_file" 2>/dev/null
+        if [[ ! -f "$m4a_file" ]]; then
+          echo "Error: Failed to convert $file to m4a" >&2
+          continue
+        fi
+        echo "    Converted: $m4a_file"
       fi
-      echo "    Converted: $m4a_file"
-    fi
-    file="$m4a_file"
-    ext="m4a"
-  fi
+      file="$m4a_file"
+      ext="m4a"
+      ;;
+    wmv)
+      mp4_file="${file%.wmv}.mp4"
+      if [[ ! -f "$mp4_file" ]]; then
+        echo "--- Converting .wmv to .mp4 ---"
+        ffmpeg -y -i "$file" -c:v libx264 -c:a aac "$mp4_file" 2>/dev/null
+        if [[ ! -f "$mp4_file" ]]; then
+          echo "Error: Failed to convert $file to mp4" >&2
+          continue
+        fi
+        echo "    Converted: $mp4_file"
+      fi
+      file="$mp4_file"
+      ext="mp4"
+      ;;
+    wma)
+      m4a_file="${file%.wma}.m4a"
+      if [[ ! -f "$m4a_file" ]]; then
+        echo "--- Converting .wma to .m4a ---"
+        ffmpeg -y -i "$file" -c:a aac "$m4a_file" 2>/dev/null
+        if [[ ! -f "$m4a_file" ]]; then
+          echo "Error: Failed to convert $file to m4a" >&2
+          continue
+        fi
+        echo "    Converted: $m4a_file"
+      fi
+      file="$m4a_file"
+      ext="m4a"
+      ;;
+    aiff)
+      wav_file="${file%.aiff}.wav"
+      if [[ ! -f "$wav_file" ]]; then
+        echo "--- Converting .aiff to .wav ---"
+        ffmpeg -y -i "$file" "$wav_file" 2>/dev/null
+        if [[ ! -f "$wav_file" ]]; then
+          echo "Error: Failed to convert $file to wav" >&2
+          continue
+        fi
+        echo "    Converted: $wav_file"
+      fi
+      file="$wav_file"
+      ext="wav"
+      ;;
+    rm)
+      mp4_file="${file%.rm}.mp4"
+      if [[ ! -f "$mp4_file" ]]; then
+        echo "--- Converting .rm (RealMedia) to .mp4 ---"
+        ffmpeg -y -i "$file" -c:v libx264 -c:a aac "$mp4_file" 2>/dev/null
+        if [[ ! -f "$mp4_file" ]]; then
+          echo "Error: Failed to convert $file to mp4" >&2
+          continue
+        fi
+        echo "    Converted: $mp4_file"
+      fi
+      file="$mp4_file"
+      ext="mp4"
+      ;;
+  esac
 
   if [[ -n "$OUTPUT_DIR" ]]; then
     outdir="$OUTPUT_DIR"
