@@ -18,3 +18,8 @@
 .yt-subs/
 __pycache__/
 *.pyc
+yt-video-*/
+ravintola-*/
+sofia-*/
+*-board.md
+*-boards/

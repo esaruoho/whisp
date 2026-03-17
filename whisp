@@ -23,6 +23,7 @@ with YouTube captions for better proper-noun accuracy.
 
 Options:
   --en               Force English
+  --fa               Force Farsi (Persian)
   --fi               Force Finnish
   --de               Force German
   --ru               Force Russian
@@ -123,6 +124,7 @@ ensure_dep() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --en)               LANGUAGE="en"; shift ;;
+    --fa)               LANGUAGE="fa"; shift ;;
     --fi)               LANGUAGE="fi"; shift ;;
     --de)               LANGUAGE="de"; shift ;;
     --ru)               LANGUAGE="ru"; shift ;;
