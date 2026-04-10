@@ -23,11 +23,21 @@ case "$(uname)" in
 esac
 
 # --- Defaults ---
+# FIRST_CHUNK_SECONDS: how much audio to wait for before the very first live
+# transcript. Short (~5s) so the user sees that the mic is working within a
+# few seconds of starting, instead of staring at a blank terminal.
+# NORMAL_CHUNK_SECONDS: cadence for all subsequent live chunks. Longer because
+# Whisper's accuracy improves with more context, and because invoking the CLI
+# has ~1-2s of model-load overhead per call.
+# OVERLAP_SECONDS: how much audio from the previous committed end to include
+# in the next chunk for context. whisp-stream-merge drops the overlap region
+# via timestamp-based dedup.
 
 LIVE_MODEL="turbo"
 FINAL_MODEL=""
-CHUNK_SECONDS=15
-OVERLAP_SECONDS=3
+FIRST_CHUNK_SECONDS=5
+NORMAL_CHUNK_SECONDS=10
+OVERLAP_SECONDS=2
 DEVICE=""
 REC_LANGUAGE=""
 REC_OUTPUT_DIR=""
@@ -174,8 +184,6 @@ while [[ $# -gt 0 ]]; do
     --sv)           REC_LANGUAGE="sv"; shift ;;
     --model)        LIVE_MODEL="$2"; shift 2 ;;
     --final-model)  FINAL_MODEL="$2"; shift 2 ;;
-    --chunk)        CHUNK_SECONDS="$2"; shift 2 ;;
-    --overlap)      OVERLAP_SECONDS="$2"; shift 2 ;;
     --device)       DEVICE="$2"; shift 2 ;;
     --out)          REC_OUT_NAME="$2"; shift 2 ;;
     --out-dir)      REC_OUTPUT_DIR="$2"; shift 2 ;;
@@ -190,6 +198,33 @@ while [[ $# -gt 0 ]]; do
 done
 
 FINAL_MODEL="${FINAL_MODEL:-$LIVE_MODEL}"
+
+# --- Language auto-detection from $LANG ---
+# Whisper's built-in language detection is unreliable on short audio (<30s)
+# and on the first few chunks of a live recording, which tends to produce the
+# famous "Thank you." hallucination for non-English speech. If the user didn't
+# explicitly pass a language flag, guess from $LANG. Handles two patterns:
+#   en_US.UTF-8        → en
+#   fi_FI.UTF-8        → fi
+#   en_US@rg=fizzzz    → fi   (English UI + Finnish regional settings)
+# The @rg= part is prioritized because it expresses the user's actual language
+# preference more reliably than the base locale.
+
+REC_LANGUAGE_SOURCE=""
+if [[ -z "$REC_LANGUAGE" && -n "${LANG:-}" ]]; then
+  if [[ "$LANG" =~ @rg=([a-z]{2}) ]]; then
+    REC_LANGUAGE="${BASH_REMATCH[1]}"
+    REC_LANGUAGE_SOURCE="\$LANG regional (@rg=)"
+  else
+    candidate="${LANG%%_*}"
+    candidate="${candidate%%.*}"
+    candidate="${candidate%%@*}"
+    if [[ "$candidate" =~ ^[a-z]{2}$ ]]; then
+      REC_LANGUAGE="$candidate"
+      REC_LANGUAGE_SOURCE="\$LANG base"
+    fi
+  fi
+fi
 
 # --- Dependency checks ---
 
@@ -263,13 +298,16 @@ fi
   echo ""
   echo "- **Started:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
   echo "- **Audio:** \`$wav_file\`"
-  echo "- **Live model:** $LIVE_MODEL"
+  echo "- **Model:** $LIVE_MODEL"
   if [[ -n "$REC_LANGUAGE" ]]; then
-    echo "- **Language:** $REC_LANGUAGE"
+    if [[ -n "$REC_LANGUAGE_SOURCE" ]]; then
+      echo "- **Language:** $REC_LANGUAGE (auto from $REC_LANGUAGE_SOURCE)"
+    else
+      echo "- **Language:** $REC_LANGUAGE"
+    fi
   else
-    echo "- **Language:** auto-detect"
+    echo "- **Language:** auto-detect (may be unreliable on short recordings)"
   fi
-  echo "- **Chunk size:** ${CHUNK_SECONDS}s (overlap ${OVERLAP_SECONDS}s)"
   echo ""
   echo "---"
   echo ""
@@ -281,16 +319,18 @@ echo ""
 echo "================================================================"
 echo "                         whisp record"
 echo "================================================================"
-echo "  Audio:       $wav_file"
-echo "  Live:        $live_md"
-echo "  Device:      $DEVICE"
-echo "  Live model:  $LIVE_MODEL"
-echo "  Final model: $FINAL_MODEL"
-echo "  Chunk size:  ${CHUNK_SECONDS}s  (overlap ${OVERLAP_SECONDS}s)"
+echo "  Audio:    $wav_file"
+echo "  Live:     $live_md"
+echo "  Device:   $DEVICE"
+echo "  Model:    $LIVE_MODEL"
 if [[ -n "$REC_LANGUAGE" ]]; then
-  echo "  Language:    $REC_LANGUAGE"
+  if [[ -n "$REC_LANGUAGE_SOURCE" ]]; then
+    echo "  Language: $REC_LANGUAGE  (auto from $REC_LANGUAGE_SOURCE — pass --en/--fi/--de/--ru/--sv/--fa to override)"
+  else
+    echo "  Language: $REC_LANGUAGE"
+  fi
 else
-  echo "  Language:    auto-detect"
+  echo "  Language: auto-detect  (pass --en/--fi/--de/--ru/--sv/--fa if Whisper guesses wrong)"
 fi
 echo ""
 echo "  Press Ctrl+C to stop recording and run the final pass."
@@ -426,6 +466,10 @@ process_chunk() {
   return $rc
 }
 
+consecutive_failures=0
+max_consecutive_failures=2
+listening_line_printed=0
+
 while kill -0 "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null; do
   if [[ "$WHISP_RECORD_STOP" -eq 1 ]]; then
     break
@@ -437,31 +481,77 @@ while kill -0 "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null; do
   fi
 
   current_duration=$(get_wav_duration "$wav_file")
-  required=$((last_processed_end + CHUNK_SECONDS))
 
-  if [[ $current_duration -lt $required ]]; then
-    sleep 2 || true
+  # Pick the target for this chunk:
+  # - very first chunk: process as soon as we have FIRST_CHUNK_SECONDS of audio
+  #   (so the user sees something within ~5 seconds, not 15)
+  # - all subsequent chunks: cadence of NORMAL_CHUNK_SECONDS
+  if [[ $chunk_index -eq 0 ]]; then
+    target=$FIRST_CHUNK_SECONDS
+  else
+    target=$((last_processed_end + NORMAL_CHUNK_SECONDS))
+  fi
+
+  if [[ $current_duration -lt $target ]]; then
+    # Liveness indicator: show elapsed recording time in-place before the
+    # very first chunk lands, so the user knows the mic is working.
+    if [[ $chunk_index -eq 0 ]]; then
+      printf "\r    Listening... %ds / %ds  (first transcript at %ds)" \
+        "$current_duration" "$target" "$target"
+      listening_line_printed=1
+    fi
+    sleep 1 || true
     continue
   fi
 
-  # Extract [last_processed_end - overlap, last_processed_end + chunk_size]
+  # About to dispatch first chunk — finalize the in-place line with a newline
+  # so subsequent output doesn't overwrite it.
+  if [[ $listening_line_printed -eq 1 ]]; then
+    printf "\r    Listening... %ds  — transcribing first chunk...            \n" \
+      "$current_duration"
+    listening_line_printed=0
+  fi
+
+  # Extract [last_processed_end - overlap, target]
   # The overlap gives whisper context at chunk boundaries; whisp-stream-merge
   # handles overlap dedup against the previous emit.
   extract_start=$last_processed_end
-  extract_duration=$CHUNK_SECONDS
+  extract_duration=$((target - last_processed_end))
   if [[ $extract_start -ge $OVERLAP_SECONDS ]]; then
     extract_start=$((extract_start - OVERLAP_SECONDS))
     extract_duration=$((extract_duration + OVERLAP_SECONDS))
   fi
 
   chunk_name="chunk-$(printf '%05d' $chunk_index)"
-  if ! process_chunk "$extract_start" "$extract_duration" "$chunk_name"; then
-    echo "    [warning: chunk $chunk_index failed — see $whisper_log / $ffmpeg_log]" >&2
+  if process_chunk "$extract_start" "$extract_duration" "$chunk_name"; then
+    # Only advance on success. If a chunk fails (e.g., whisper killed by a
+    # Ctrl+C propagated through the process group), the next iteration will
+    # retry the same range — or the trailing-audio pass at shutdown will
+    # pick up the missed region because last_processed_end didn't advance.
+    last_processed_end=$target
+    consecutive_failures=0
+    chunk_index=$((chunk_index + 1))
+  else
+    consecutive_failures=$((consecutive_failures + 1))
+    echo "    [warning: chunk $chunk_index failed (attempt $consecutive_failures/$max_consecutive_failures) — see $whisper_log / $ffmpeg_log]" >&2
+    if [[ $consecutive_failures -ge $max_consecutive_failures ]]; then
+      # Persistent failure — skip this chunk's range and move on so we don't
+      # loop forever. The trailing / final pass will re-transcribe the
+      # whole WAV anyway, so the audio isn't lost.
+      echo "    [warning: skipping chunk $chunk_index after $consecutive_failures failures]" >&2
+      last_processed_end=$target
+      consecutive_failures=0
+      chunk_index=$((chunk_index + 1))
+    fi
+    # Otherwise: sleep briefly and retry same range on next iteration
+    sleep 1 || true
   fi
-
-  last_processed_end=$((last_processed_end + CHUNK_SECONDS))
-  chunk_index=$((chunk_index + 1))
 done
+
+# Finalize listening line if we exited without ever processing a chunk
+if [[ $listening_line_printed -eq 1 ]]; then
+  printf "\r                                                                     \r"
+fi
 
 # --- Wait for ffmpeg to fully exit ---
 
@@ -516,7 +606,16 @@ if [[ "$NO_FINAL" == "true" ]]; then
   echo "Skipping final pass (--no-final)."
 else
   echo ""
-  echo "=== Final pass: $FINAL_MODEL ==="
+  if [[ -n "$REC_LANGUAGE" ]]; then
+    echo "=== Final pass: $FINAL_MODEL (language: $REC_LANGUAGE) ==="
+  else
+    echo "=== Final pass: $FINAL_MODEL (language: auto-detect) ==="
+    if (( final_duration < 30 )); then
+      echo "    Note: recording is only ${final_duration}s. Whisper auto-detect is" >&2
+      echo "    unreliable on short audio. If the result looks wrong, re-run" >&2
+      echo "    with an explicit language flag (e.g. --fi) next time." >&2
+    fi
+  fi
   final_args=(
     "$wav_file"
     --model "$FINAL_MODEL"
