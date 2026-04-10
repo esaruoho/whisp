@@ -199,32 +199,9 @@ done
 
 FINAL_MODEL="${FINAL_MODEL:-$LIVE_MODEL}"
 
-# --- Language auto-detection from $LANG ---
-# Whisper's built-in language detection is unreliable on short audio (<30s)
-# and on the first few chunks of a live recording, which tends to produce the
-# famous "Thank you." hallucination for non-English speech. If the user didn't
-# explicitly pass a language flag, guess from $LANG. Handles two patterns:
-#   en_US.UTF-8        → en
-#   fi_FI.UTF-8        → fi
-#   en_US@rg=fizzzz    → fi   (English UI + Finnish regional settings)
-# The @rg= part is prioritized because it expresses the user's actual language
-# preference more reliably than the base locale.
-
-REC_LANGUAGE_SOURCE=""
-if [[ -z "$REC_LANGUAGE" && -n "${LANG:-}" ]]; then
-  if [[ "$LANG" =~ @rg=([a-z]{2}) ]]; then
-    REC_LANGUAGE="${BASH_REMATCH[1]}"
-    REC_LANGUAGE_SOURCE="\$LANG regional (@rg=)"
-  else
-    candidate="${LANG%%_*}"
-    candidate="${candidate%%.*}"
-    candidate="${candidate%%@*}"
-    if [[ "$candidate" =~ ^[a-z]{2}$ ]]; then
-      REC_LANGUAGE="$candidate"
-      REC_LANGUAGE_SOURCE="\$LANG base"
-    fi
-  fi
-fi
+# Language detection is Whisper's job. We pass --language only if the user
+# explicitly asked for it via --en/--fi/etc; otherwise whisper auto-detects
+# from the actual audio content, which is the right abstraction layer.
 
 # --- Dependency checks ---
 
@@ -300,13 +277,9 @@ fi
   echo "- **Audio:** \`$wav_file\`"
   echo "- **Model:** $LIVE_MODEL"
   if [[ -n "$REC_LANGUAGE" ]]; then
-    if [[ -n "$REC_LANGUAGE_SOURCE" ]]; then
-      echo "- **Language:** $REC_LANGUAGE (auto from $REC_LANGUAGE_SOURCE)"
-    else
-      echo "- **Language:** $REC_LANGUAGE"
-    fi
+    echo "- **Language:** $REC_LANGUAGE"
   else
-    echo "- **Language:** auto-detect (may be unreliable on short recordings)"
+    echo "- **Language:** auto-detect (Whisper detects from audio)"
   fi
   echo ""
   echo "---"
@@ -324,13 +297,9 @@ echo "  Live:     $live_md"
 echo "  Device:   $DEVICE"
 echo "  Model:    $LIVE_MODEL"
 if [[ -n "$REC_LANGUAGE" ]]; then
-  if [[ -n "$REC_LANGUAGE_SOURCE" ]]; then
-    echo "  Language: $REC_LANGUAGE  (auto from $REC_LANGUAGE_SOURCE — pass --en/--fi/--de/--ru/--sv/--fa to override)"
-  else
-    echo "  Language: $REC_LANGUAGE"
-  fi
+  echo "  Language: $REC_LANGUAGE  (forced)"
 else
-  echo "  Language: auto-detect  (pass --en/--fi/--de/--ru/--sv/--fa if Whisper guesses wrong)"
+  echo "  Language: auto-detect from audio"
 fi
 echo ""
 echo "  Press Ctrl+C to stop recording and run the final pass."
@@ -400,6 +369,79 @@ fi
 
 echo "    Recording active (ffmpeg PID: $WHISP_RECORD_FFMPEG_PID)"
 echo ""
+
+# --- Silence probe ---
+# On macOS, if microphone permission is denied, avfoundation silently returns
+# a stream of zeros instead of erroring. ffmpeg happily records the zeros and
+# nothing looks wrong until Whisper transcribes 30 seconds of silence as
+# "Thank you." (its classic hallucination on pure silence). This check
+# catches that case and tells the user what's wrong before they waste a
+# whole recording session.
+#
+# Wait a few seconds past the startup check so we have real audio to probe,
+# then extract the first ~2 seconds and measure its max volume. Anything
+# below -50 dB is effectively silence (normal speech peaks around -20 dB).
+
+echo "    Probing audio level..."
+sleep 3 || true
+probe_wav="$WHISP_RECORD_STATE_DIR/probe.wav"
+probe_max_vol=""
+if ffmpeg -hide_banner -y -ignore_length 1 -t 2 -i "$wav_file" \
+    -ac 1 -ar 16000 -c:a pcm_s16le "$probe_wav" \
+    </dev/null >/dev/null 2>&1 && [[ -s "$probe_wav" ]]; then
+  probe_max_vol=$(ffmpeg -hide_banner -i "$probe_wav" -af volumedetect -f null /dev/null 2>&1 \
+    | awk '/max_volume/ {print $5; exit}')
+fi
+rm -f "$probe_wav"
+
+if [[ -n "$probe_max_vol" ]] && awk -v v="$probe_max_vol" 'BEGIN{exit !(v+0 < -50)}'; then
+  echo "" >&2
+  echo "================================================================" >&2
+  echo "  WARNING: microphone appears SILENT" >&2
+  echo "  (first 2 seconds peak at ${probe_max_vol} dB — below -50 dB threshold)" >&2
+  echo "================================================================" >&2
+  echo "" >&2
+  echo "  No audio is being captured. Normal speech peaks around -20 dB;" >&2
+  echo "  ${probe_max_vol} dB is essentially digital silence." >&2
+  echo "" >&2
+  echo "  Most likely causes, in order:" >&2
+  echo "" >&2
+  if [[ "$OS" == "darwin" ]]; then
+    echo "  1. macOS microphone permission is DENIED for your terminal app." >&2
+    echo "     On macOS, denied mic access returns silence instead of an error," >&2
+    echo "     so there is no permission prompt — you have to toggle it manually:" >&2
+    echo "" >&2
+    echo "       System Settings > Privacy & Security > Microphone" >&2
+    echo "" >&2
+    echo "     Find your terminal app (Terminal.app, iTerm2, Ghostty, etc.) in" >&2
+    echo "     the list and toggle it ON. If it is not in the list, the first" >&2
+    echo "     recording should have added it. You may need to fully quit and" >&2
+    echo "     relaunch the terminal app after toggling." >&2
+    echo "" >&2
+    echo "  2. Wrong input device. Run:  whisp record --list-devices" >&2
+    echo "     then:  whisp record --device \":N\"  (where N is the audio device index)" >&2
+    echo "" >&2
+    echo "  3. Input volume is muted or zero in System Settings > Sound > Input." >&2
+  else
+    echo "  1. Wrong input source. Run:  whisp record --list-devices" >&2
+    echo "  2. PulseAudio/PipeWire input source muted or at zero." >&2
+  fi
+  echo "" >&2
+  echo "  Recording will continue so you can decide what to do. Press Ctrl+C" >&2
+  echo "  to stop and fix the problem. If you think this was a false alarm" >&2
+  echo "  (you were quiet for the first few seconds), just keep talking and" >&2
+  echo "  the next chunks will transcribe fine." >&2
+  echo "" >&2
+  echo "================================================================" >&2
+  echo "" >&2
+elif [[ -n "$probe_max_vol" ]]; then
+  echo "    Audio level OK (peak ${probe_max_vol} dB in first 2s)"
+  echo ""
+else
+  # Probe itself failed — might be racing with ffmpeg. Warn softly and continue.
+  echo "    [note: audio level probe inconclusive — recording continues]" >&2
+  echo ""
+fi
 
 # --- Live transcribe loop ---
 
@@ -609,12 +651,7 @@ else
   if [[ -n "$REC_LANGUAGE" ]]; then
     echo "=== Final pass: $FINAL_MODEL (language: $REC_LANGUAGE) ==="
   else
-    echo "=== Final pass: $FINAL_MODEL (language: auto-detect) ==="
-    if (( final_duration < 30 )); then
-      echo "    Note: recording is only ${final_duration}s. Whisper auto-detect is" >&2
-      echo "    unreliable on short audio. If the result looks wrong, re-run" >&2
-      echo "    with an explicit language flag (e.g. --fi) next time." >&2
-    fi
+    echo "=== Final pass: $FINAL_MODEL (language: auto-detect from audio) ==="
   fi
   final_args=(
     "$wav_file"
