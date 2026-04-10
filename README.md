@@ -95,6 +95,54 @@ whisp video.mp4 https://www.youtube.com/watch?v=ABC123
 
 mp3, m4a, ogg, wav, flac, mp4, mkv, webm, avi, mov
 
+### Recording mode
+
+Record audio from your microphone, see transcripts streaming live as you speak, and get a full high-quality transcript the moment you stop. Useful for lectures, interviews, meetings, and any other "I want to participate AND have a transcript" situation.
+
+```bash
+whisp record                     # start recording; Ctrl+C to stop
+whisp record --fi                # Finnish lecture
+whisp record --out lecture       # lecture.wav, lecture.live.md, lecture.txt, ...
+whisp record --list-devices      # see available mics
+whisp record --no-live           # just record; transcribe only at the end
+whisp record --no-final          # live only; no final high-quality pass
+```
+
+**How it works.** `whisp record` starts `ffmpeg` capturing your mic to a `.wav` file (16 kHz mono PCM). While recording, a background loop transcribes the audio in short segments using the same `turbo` model whisp uses for files, dedupes overlap between segments, and appends the new text to a `<base>.live.md` file. Hit `Ctrl+C` and it stops the recording, processes any trailing audio, then runs a final full-quality pass on the complete `.wav` through the normal whisp pipeline (Whisper + deloop), producing the usual 5 output formats.
+
+**Live latency** is on the order of 15–25 seconds between "someone said it" and "you see it on screen." Good for grabbing quotes into your notes; too slow for responding to something you missed mid-conversation.
+
+**Where to watch the live transcript.** The `.live.md` file is appended to continuously and is also printed to the `whisp record` terminal as it arrives. Open it in Obsidian with auto-reload, `less +F` in another pane, or any text editor that auto-refreshes.
+
+**Output files.**
+
+```
+whisp-recording-20260410-143000.wav       # raw audio (always kept)
+whisp-recording-20260410-143000.live.md   # live streaming transcript (always kept)
+whisp-recording-20260410-143000.txt       # final high-quality transcript
+.srt / .vtt / .tsv / .json                # (same base name)
+```
+
+The `.live.md` is a permanent historical record of what you saw in the room during the session — it's not deleted when the final pass runs. The final `.txt` / `.srt` / etc. are the authoritative transcripts.
+
+**macOS microphone permission.** First run will prompt macOS to grant your terminal app (Terminal.app, iTerm2, etc.) microphone access. If `ffmpeg` exits immediately with "Operation not permitted", grant access in `System Settings → Privacy & Security → Microphone` and re-run.
+
+**Archive is off by default for record mode.** In-person recordings are more privacy-sensitive than file-based transcription runs. Pass `--archive` if you explicitly want the final transcript pushed to `~/work/whisp-transcripts`.
+
+**Options:**
+
+| Flag | Description |
+|---|---|
+| `--en`, `--fa`, `--fi`, `--de`, `--ru`, `--sv` | Force language |
+| `--model NAME` | Whisper model (default: `turbo` — same as whisp) |
+| `--device DEV` | Audio input (macOS: `:0`, `:1`, ...; Linux: PulseAudio source name) |
+| `--out NAME` | Output base filename (default: `whisp-recording-<timestamp>`) |
+| `--out-dir DIR` | Output directory (default: current directory) |
+| `--no-live` | Skip live transcription — just record audio |
+| `--no-final` | Skip the final high-quality pass |
+| `--archive` | Push final transcript to `~/work/whisp-transcripts` (opt-in) |
+| `--list-devices` | List available audio input devices and exit |
+
 ## Output
 
 Generates five output formats per file:
@@ -110,6 +158,7 @@ Generates five output formats per file:
 1. **Whisper transcription** — runs OpenAI Whisper with hallucination silence filtering (2s threshold by default) and conditioning on previous text disabled
 2. **Deloop** (`whisp-deloop`) — post-processes the JSON output to strip hallucination loops (3+ consecutive identical segments like "Thank you. Thank you. Thank you.")
 3. **YouTube merge** (`whisp-merge`, optional) — when a YouTube URL is provided, downloads captions in parallel with Whisper, then merges proper nouns from YouTube's captions into the Whisper output using word-level timestamps and confidence scores
+4. **Live recording** (`whisp-record` + `whisp-stream-merge`, optional) — `whisp record` captures mic audio to a WAV, transcribes it in overlapping chunks with the same `turbo` model whisp uses for files, dedupes overlap against the previous chunk's emitted timestamps, and appends new text to a `.live.md` file. On Ctrl+C, runs the normal pipeline (Whisper + deloop) on the full recording for the authoritative final transcript.
 
 ## License
 

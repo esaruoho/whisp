@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+# whisp-record — record audio and live-transcribe during the session,
+# then run a final high-quality pass on stop.
+#
+# Usage: whisp record [OPTIONS]
+#   (normally dispatched from the main `whisp` script)
+#
+# This is a standalone sibling to whisp, whisp-deloop, whisp-merge, and
+# whisp-stream-merge. It matches whisp's "bash orchestrates, external tools
+# do the work" pattern and duplicates the install-prompt helpers so it can
+# run on its own.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- OS detection ---
+
+case "$(uname)" in
+  Darwin) OS="darwin" ;;
+  Linux)  OS="linux" ;;
+  *)      echo "Error: whisp record not supported on $(uname)" >&2; exit 1 ;;
+esac
+
+# --- Defaults ---
+
+LIVE_MODEL="turbo"
+FINAL_MODEL=""
+CHUNK_SECONDS=15
+OVERLAP_SECONDS=3
+DEVICE=""
+REC_LANGUAGE=""
+REC_OUTPUT_DIR=""
+REC_OUT_NAME=""
+NO_FINAL="false"
+NO_LIVE="false"
+DO_ARCHIVE="false"
+LIST_DEVICES="false"
+
+if [[ "$OS" == "darwin" ]]; then
+  DEVICE=":0"
+else
+  DEVICE="default"
+fi
+
+# --- Globals for signal handling ---
+
+WHISP_RECORD_FFMPEG_PID=""
+WHISP_RECORD_STOP=0
+WHISP_RECORD_STATE_DIR=""
+
+# --- Helpers (duplicated from whisp so this script is self-contained) ---
+
+HAS_BREW=""
+if command -v brew &>/dev/null; then
+  HAS_BREW=1
+fi
+
+install_prompt() {
+  local pkg="$1"
+  local install_cmd="$2"
+  echo ""
+  echo "Missing dependency: $pkg"
+  echo "Install command:    $install_cmd"
+  read -rp "Install now? [Y/n] " answer
+  case "${answer:-Y}" in
+    [Yy]*) eval "$install_cmd" ;;
+    *)     echo "Aborted. Install '$pkg' manually and re-run." >&2; exit 1 ;;
+  esac
+}
+
+ensure_brew() {
+  [[ -n "$HAS_BREW" ]] && return
+  echo ""
+  echo "Homebrew not found. whisp uses brew to install dependencies on macOS."
+  echo "Install command:    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+  read -rp "Install Homebrew now? [Y/n] " answer
+  case "${answer:-Y}" in
+    [Yy]*)
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+      elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+      fi
+      HAS_BREW=1
+      ;;
+    *) echo "Aborted." >&2; exit 1 ;;
+  esac
+}
+
+ensure_dep() {
+  local cmd="$1"
+  local brew_pkg="$2"
+  local apt_pkg="${3:-$brew_pkg}"
+
+  command -v "$cmd" &>/dev/null && return
+
+  if [[ "$OS" == "darwin" ]]; then
+    ensure_brew
+    install_prompt "$brew_pkg" "brew install $brew_pkg"
+  elif command -v apt-get &>/dev/null; then
+    install_prompt "$apt_pkg" "sudo apt-get update && sudo apt-get install -y $apt_pkg"
+  else
+    echo "Error: '$cmd' not found and no supported package manager detected." >&2
+    exit 1
+  fi
+
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: '$cmd' still not found after install." >&2
+    exit 1
+  fi
+}
+
+# --- Usage ---
+
+usage() {
+  cat <<'USAGE'
+Usage: whisp record [OPTIONS]
+
+Record audio from the microphone, live-transcribe it in chunks while
+recording, then run a final high-quality pass when you stop with Ctrl+C.
+
+During the session, transcribed text streams to stdout AND is appended to a
+.live.md file you can open in another window (Obsidian, less +F, a text
+editor). On Ctrl+C, the raw audio is transcribed in full at the final
+model quality, with hallucination-loop removal, producing the usual 5 output
+formats (.txt/.srt/.vtt/.tsv/.json).
+
+Options:
+  --en, --fa, --fi, --de, --ru, --sv   Force language
+  --model NAME           Whisper model (default: turbo — same as whisp)
+  --device DEV           Audio input device
+                           macOS: ":0" (first input, default), ":1", etc.
+                           Linux: "default" (default), or a PulseAudio source
+  --out NAME             Output base filename (default: whisp-recording-<ts>)
+  --out-dir DIR          Output directory (default: current directory)
+  --no-live              Skip live transcription — just record audio
+  --no-final             Skip the final high-quality pass
+  --archive              Push final transcript to ~/work/whisp-transcripts
+                         (default: OFF for record mode; in-person recordings
+                          are more privacy-sensitive than file-based runs)
+  --list-devices         List available audio input devices and exit
+  -h, --help             Show this help
+
+Output files:
+  <base>.wav              Raw audio (16kHz mono PCM)
+  <base>.live.md          Live streaming transcript (kept permanently)
+  <base>.{txt,srt,vtt,tsv,json}   Final high-quality transcript
+
+Examples:
+  whisp record                      # start recording, Ctrl+C to stop
+  whisp record --fi                 # Finnish lecture
+  whisp record --out lecture        # name files lecture.wav, lecture.live.md, etc.
+  whisp record --list-devices       # see available mics
+  whisp record --no-live            # just record audio, transcribe at end
+
+First-run note (macOS):
+  macOS will ask for Microphone permission for your terminal app on first
+  run. If ffmpeg exits immediately with "Operation not permitted", grant
+  access in System Settings > Privacy & Security > Microphone, then re-run.
+USAGE
+}
+
+# --- Arg parsing ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --en)           REC_LANGUAGE="en"; shift ;;
+    --fa)           REC_LANGUAGE="fa"; shift ;;
+    --fi)           REC_LANGUAGE="fi"; shift ;;
+    --de)           REC_LANGUAGE="de"; shift ;;
+    --ru)           REC_LANGUAGE="ru"; shift ;;
+    --sv)           REC_LANGUAGE="sv"; shift ;;
+    --model)        LIVE_MODEL="$2"; shift 2 ;;
+    --final-model)  FINAL_MODEL="$2"; shift 2 ;;
+    --chunk)        CHUNK_SECONDS="$2"; shift 2 ;;
+    --overlap)      OVERLAP_SECONDS="$2"; shift 2 ;;
+    --device)       DEVICE="$2"; shift 2 ;;
+    --out)          REC_OUT_NAME="$2"; shift 2 ;;
+    --out-dir)      REC_OUTPUT_DIR="$2"; shift 2 ;;
+    --no-live)      NO_LIVE="true"; shift ;;
+    --no-final)     NO_FINAL="true"; shift ;;
+    --archive)      DO_ARCHIVE="true"; shift ;;
+    --list-devices) LIST_DEVICES="true"; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             echo "Unknown option: $1" >&2; echo "Run 'whisp record --help' for usage." >&2; exit 1 ;;
+    *)              echo "Unexpected argument: $1" >&2; echo "Run 'whisp record --help' for usage." >&2; exit 1 ;;
+  esac
+done
+
+FINAL_MODEL="${FINAL_MODEL:-$LIVE_MODEL}"
+
+# --- Dependency checks ---
+
+ensure_dep ffmpeg ffmpeg
+ensure_dep ffprobe ffmpeg
+ensure_dep whisper openai-whisper
+
+# --- List devices mode ---
+
+if [[ "$LIST_DEVICES" == "true" ]]; then
+  if [[ "$OS" == "darwin" ]]; then
+    echo "Available input devices (macOS / avfoundation):"
+    echo "Use --device \":N\" where N is the audio device index."
+    echo ""
+    ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 \
+      | grep -E "AVFoundation|\] \[" || true
+  else
+    echo "Available input sources (Linux):"
+    if command -v pactl &>/dev/null && pactl info &>/dev/null; then
+      echo "PulseAudio/PipeWire sources:"
+      pactl list sources short 2>&1 || true
+      echo ""
+      echo "Use --device <name> or --device default for the system default."
+    elif command -v arecord &>/dev/null; then
+      echo "ALSA devices:"
+      arecord -l 2>&1 || true
+    else
+      echo "No pactl or arecord found — install pulseaudio-utils or alsa-utils."
+    fi
+  fi
+  exit 0
+fi
+
+# --- Setup output paths ---
+
+if [[ -n "$REC_OUTPUT_DIR" ]]; then
+  outdir="$REC_OUTPUT_DIR"
+else
+  outdir="$(pwd)"
+fi
+mkdir -p "$outdir"
+
+session_ts="$(date +%Y%m%d-%H%M%S)"
+if [[ -n "$REC_OUT_NAME" ]]; then
+  base_name="${REC_OUT_NAME%.wav}"
+  base_name="${base_name##*/}"
+else
+  base_name="whisp-recording-${session_ts}"
+fi
+
+wav_file="$outdir/$base_name.wav"
+live_md="$outdir/$base_name.live.md"
+WHISP_RECORD_STATE_DIR="$outdir/.${base_name}.state"
+state_json="$WHISP_RECORD_STATE_DIR/state.json"
+chunks_dir="$WHISP_RECORD_STATE_DIR/chunks"
+ffmpeg_log="$WHISP_RECORD_STATE_DIR/ffmpeg.log"
+whisper_log="$WHISP_RECORD_STATE_DIR/whisper.log"
+
+mkdir -p "$WHISP_RECORD_STATE_DIR" "$chunks_dir"
+
+# Refuse to clobber an existing WAV
+if [[ -f "$wav_file" ]]; then
+  echo "Error: $wav_file already exists. Pass --out NAME to pick a different name." >&2
+  rm -rf "$WHISP_RECORD_STATE_DIR"
+  exit 1
+fi
+
+# Initialize live.md
+{
+  echo "# whisp record — $base_name"
+  echo ""
+  echo "- **Started:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo "- **Audio:** \`$wav_file\`"
+  echo "- **Live model:** $LIVE_MODEL"
+  if [[ -n "$REC_LANGUAGE" ]]; then
+    echo "- **Language:** $REC_LANGUAGE"
+  else
+    echo "- **Language:** auto-detect"
+  fi
+  echo "- **Chunk size:** ${CHUNK_SECONDS}s (overlap ${OVERLAP_SECONDS}s)"
+  echo ""
+  echo "---"
+  echo ""
+} > "$live_md"
+
+# --- Banner ---
+
+echo ""
+echo "================================================================"
+echo "                         whisp record"
+echo "================================================================"
+echo "  Audio:       $wav_file"
+echo "  Live:        $live_md"
+echo "  Device:      $DEVICE"
+echo "  Live model:  $LIVE_MODEL"
+echo "  Final model: $FINAL_MODEL"
+echo "  Chunk size:  ${CHUNK_SECONDS}s  (overlap ${OVERLAP_SECONDS}s)"
+if [[ -n "$REC_LANGUAGE" ]]; then
+  echo "  Language:    $REC_LANGUAGE"
+else
+  echo "  Language:    auto-detect"
+fi
+echo ""
+echo "  Press Ctrl+C to stop recording and run the final pass."
+echo "  Open the .live.md file in another window to watch the transcript."
+if [[ "$OS" == "darwin" ]]; then
+  echo ""
+  echo "  macOS: if ffmpeg fails immediately with a permission error, grant"
+  echo "  your terminal Microphone access in"
+  echo "  System Settings > Privacy & Security > Microphone, then re-run."
+fi
+echo "================================================================"
+echo ""
+
+# --- Start ffmpeg recording in background ---
+
+if [[ "$OS" == "darwin" ]]; then
+  ffmpeg_input_args=(-f avfoundation -i "$DEVICE")
+else
+  if command -v pactl &>/dev/null && pactl info &>/dev/null; then
+    ffmpeg_input_args=(-f pulse -i "$DEVICE")
+  else
+    ffmpeg_input_args=(-f alsa -i "$DEVICE")
+  fi
+fi
+
+ffmpeg -hide_banner "${ffmpeg_input_args[@]}" \
+  -ac 1 -ar 16000 -c:a pcm_s16le \
+  -y "$wav_file" </dev/null >/dev/null 2>"$ffmpeg_log" &
+WHISP_RECORD_FFMPEG_PID=$!
+
+# --- Signal trap ---
+
+cleanup_signal() {
+  WHISP_RECORD_STOP=1
+  if [[ -n "$WHISP_RECORD_FFMPEG_PID" ]] && kill -0 "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null; then
+    echo ""
+    echo ""
+    echo "=== Ctrl+C received — stopping recording... ==="
+    kill -INT "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup_signal INT TERM
+
+# --- Startup sanity check ---
+# If ffmpeg dies within ~1.5s, it's likely a permission or device error.
+
+sleep 1.5 || true
+if ! kill -0 "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null; then
+  echo "Error: ffmpeg exited immediately. Last lines of ffmpeg log:" >&2
+  echo "----" >&2
+  tail -n 20 "$ffmpeg_log" >&2 || true
+  echo "----" >&2
+  if grep -qi "operation not permitted\|permission denied\|abort" "$ffmpeg_log" 2>/dev/null; then
+    echo "" >&2
+    echo "This looks like a microphone permission error." >&2
+    if [[ "$OS" == "darwin" ]]; then
+      echo "" >&2
+      echo "Grant your terminal app microphone access:" >&2
+      echo "  System Settings > Privacy & Security > Microphone" >&2
+      echo "" >&2
+      echo "Then re-run 'whisp record'." >&2
+    fi
+  fi
+  rm -rf "$WHISP_RECORD_STATE_DIR"
+  exit 1
+fi
+
+echo "    Recording active (ffmpeg PID: $WHISP_RECORD_FFMPEG_PID)"
+echo ""
+
+# --- Live transcribe loop ---
+
+last_processed_end=0
+chunk_index=0
+bytes_per_second=$((16000 * 2))   # 16kHz mono 16-bit PCM
+header_bytes=44                    # RIFF WAV header
+
+get_wav_duration() {
+  local f="$1"
+  local b=0
+  [[ -f "$f" ]] || { echo 0; return; }
+  if [[ "$OS" == "darwin" ]]; then
+    b=$(stat -f%z "$f" 2>/dev/null || echo 0)
+  else
+    b=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  fi
+  local data=$((b - header_bytes))
+  (( data < 0 )) && data=0
+  echo $((data / bytes_per_second))
+}
+
+process_chunk() {
+  local start_offset="$1"
+  local duration="$2"
+  local chunk_name="$3"
+  local chunk_wav="$chunks_dir/$chunk_name.wav"
+  local chunk_json="$chunks_dir/$chunk_name.json"
+  local rc=0
+
+  if ! ffmpeg -hide_banner -y -ignore_length 1 \
+      -ss "$start_offset" -t "$duration" \
+      -i "$wav_file" \
+      -ac 1 -ar 16000 -c:a pcm_s16le "$chunk_wav" \
+      </dev/null >>"$ffmpeg_log" 2>&1; then
+    rc=1
+  elif [[ ! -s "$chunk_wav" ]]; then
+    rc=1
+  else
+    local whisper_args=(
+      "$chunk_wav"
+      --model "$LIVE_MODEL"
+      --output_format json
+      --output_dir "$chunks_dir"
+      --condition_on_previous_text False
+      --hallucination_silence_threshold 2
+    )
+    if [[ -n "$REC_LANGUAGE" ]]; then
+      whisper_args+=(--language "$REC_LANGUAGE")
+    fi
+
+    if whisper "${whisper_args[@]}" </dev/null >>"$whisper_log" 2>&1 && [[ -f "$chunk_json" ]]; then
+      python3 "$SCRIPT_DIR/whisp-stream-merge" \
+        "$chunk_json" "$live_md" "$state_json" "$start_offset" \
+        || true
+    else
+      rc=1
+    fi
+  fi
+
+  # Clean up any files whisper or ffmpeg dropped for this chunk, regardless
+  # of success. Keeps the chunks_dir from exploding across a long session.
+  rm -f "$chunks_dir/$chunk_name".* 2>/dev/null || true
+  return $rc
+}
+
+while kill -0 "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null; do
+  if [[ "$WHISP_RECORD_STOP" -eq 1 ]]; then
+    break
+  fi
+
+  if [[ "$NO_LIVE" == "true" ]]; then
+    sleep 5 || true
+    continue
+  fi
+
+  current_duration=$(get_wav_duration "$wav_file")
+  required=$((last_processed_end + CHUNK_SECONDS))
+
+  if [[ $current_duration -lt $required ]]; then
+    sleep 2 || true
+    continue
+  fi
+
+  # Extract [last_processed_end - overlap, last_processed_end + chunk_size]
+  # The overlap gives whisper context at chunk boundaries; whisp-stream-merge
+  # handles overlap dedup against the previous emit.
+  extract_start=$last_processed_end
+  extract_duration=$CHUNK_SECONDS
+  if [[ $extract_start -ge $OVERLAP_SECONDS ]]; then
+    extract_start=$((extract_start - OVERLAP_SECONDS))
+    extract_duration=$((extract_duration + OVERLAP_SECONDS))
+  fi
+
+  chunk_name="chunk-$(printf '%05d' $chunk_index)"
+  if ! process_chunk "$extract_start" "$extract_duration" "$chunk_name"; then
+    echo "    [warning: chunk $chunk_index failed — see $whisper_log / $ffmpeg_log]" >&2
+  fi
+
+  last_processed_end=$((last_processed_end + CHUNK_SECONDS))
+  chunk_index=$((chunk_index + 1))
+done
+
+# --- Wait for ffmpeg to fully exit ---
+
+wait "$WHISP_RECORD_FFMPEG_PID" 2>/dev/null || true
+WHISP_RECORD_FFMPEG_PID=""
+trap - INT TERM
+
+echo ""
+echo "=== Recording stopped ==="
+
+if [[ ! -s "$wav_file" ]]; then
+  echo "Error: no recording data produced." >&2
+  rm -rf "$WHISP_RECORD_STATE_DIR"
+  exit 1
+fi
+
+final_duration=$(get_wav_duration "$wav_file")
+echo "    Duration: ${final_duration}s"
+echo "    Audio:    $wav_file"
+
+# --- Process trailing audio (everything past last_processed_end) ---
+
+if [[ "$NO_LIVE" != "true" && $final_duration -gt $last_processed_end ]]; then
+  echo "    Processing trailing audio (${last_processed_end}s → ${final_duration}s)..."
+  tail_start=$last_processed_end
+  if [[ $tail_start -ge $OVERLAP_SECONDS ]]; then
+    tail_start=$((tail_start - OVERLAP_SECONDS))
+  fi
+  tail_duration=$((final_duration - tail_start + 1))
+  if (( tail_duration > 0 )); then
+    process_chunk "$tail_start" "$tail_duration" "chunk-final" || true
+  fi
+fi
+
+# --- Append stop marker to live.md ---
+
+{
+  echo ""
+  echo "---"
+  echo ""
+  echo "- **Stopped:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo "- **Duration:** ${final_duration}s"
+} >> "$live_md"
+
+echo "    Live:     $live_md"
+
+# --- Final high-quality pass ---
+
+final_pass_ran=false
+if [[ "$NO_FINAL" == "true" ]]; then
+  echo ""
+  echo "Skipping final pass (--no-final)."
+else
+  echo ""
+  echo "=== Final pass: $FINAL_MODEL ==="
+  final_args=(
+    "$wav_file"
+    --model "$FINAL_MODEL"
+    --output_format all
+    --output_dir "$outdir"
+    --condition_on_previous_text False
+    --hallucination_silence_threshold 2
+  )
+  if [[ -n "$REC_LANGUAGE" ]]; then
+    final_args+=(--language "$REC_LANGUAGE")
+  fi
+
+  if whisper "${final_args[@]}"; then
+    echo ""
+    echo "--- Deloop: checking for hallucination loops ---"
+    python3 "$SCRIPT_DIR/whisp-deloop" "$base_name" "$outdir" || true
+    final_pass_ran=true
+    echo ""
+    echo "Final output files:"
+    for ext in txt srt vtt tsv json; do
+      target="$outdir/$base_name.$ext"
+      if [[ -f "$target" ]]; then
+        echo "  $target"
+      fi
+    done
+  else
+    echo "Error: final pass failed." >&2
+    echo "You can retry later with: whisp \"$wav_file\"" >&2
+  fi
+fi
+
+# --- Optional archive ---
+# Record mode defaults to NOT archiving because in-person recordings are more
+# privacy-sensitive than file-based transcription runs.
+
+if [[ "$DO_ARCHIVE" == "true" && "$final_pass_ran" == "true" ]]; then
+  TRANSCRIPTS_REPO="$HOME/work/whisp-transcripts"
+  if [[ -d "$TRANSCRIPTS_REPO/.git" ]]; then
+    echo ""
+    echo "=== Archiving to whisp-transcripts ==="
+    ( cd "$TRANSCRIPTS_REPO" && git pull --rebase --autostash 2>/dev/null || true )
+
+    today="$(date +%Y-%m-%d)"
+    slug="$(echo "$base_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | head -c 80)"
+    transcript_dir="$TRANSCRIPTS_REPO/transcripts/${today}_${slug}"
+    [[ -d "$transcript_dir" ]] && transcript_dir="${transcript_dir}_$(date +%s)"
+    mkdir -p "$transcript_dir"
+
+    for ext in txt json srt vtt tsv; do
+      src="$outdir/$base_name.$ext"
+      [[ -f "$src" ]] && cp "$src" "$transcript_dir/transcript.$ext"
+    done
+    [[ -f "$live_md" ]] && cp "$live_md" "$transcript_dir/live.md"
+
+    cat > "$transcript_dir/metadata.yaml" <<METAEOF
+title: "$(echo "$base_name" | sed 's/"/\\"/g')"
+source_file: "$(basename "$wav_file")"
+duration_seconds: ${final_duration}
+whisper_model: $FINAL_MODEL
+language: ${REC_LANGUAGE:-auto}
+transcribed_date: "$today"
+source: record
+
+concepts: []
+people: []
+domains: []
+METAEOF
+
+    (
+      cd "$TRANSCRIPTS_REPO"
+      git add transcripts/
+      git commit -m "record: $base_name from $(hostname -s)" 2>/dev/null || true
+      if git push 2>/dev/null; then
+        echo "    Pushed to repo."
+      else
+        echo "    Push failed — will retry next time."
+      fi
+    )
+  else
+    echo ""
+    echo "Note: --archive requested but $TRANSCRIPTS_REPO not found."
+  fi
+elif [[ "$DO_ARCHIVE" != "true" ]]; then
+  echo ""
+  echo "Note: record mode did not archive to whisp-transcripts (use --archive to opt in)."
+fi
+
+# --- Clean up state directory ---
+
+rm -rf "$WHISP_RECORD_STATE_DIR"
+
+echo ""
+echo "All done."

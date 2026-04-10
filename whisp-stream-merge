@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Append a new Whisper chunk's segments to a live running transcript file.
+
+Called once per chunk during `whisp record` live transcription. Reads the
+chunk's Whisper JSON output, shifts timestamps to absolute (full-recording)
+time, drops segments that overlap with already-emitted segments (to handle
+chunk-boundary overlap), and appends the rest to the .live.md file.
+
+State is persisted in state.json so successive calls know where the last
+chunk left off.
+
+Usage: whisp-stream-merge <chunk_json> <live_md> <state_json> <chunk_offset>
+
+  chunk_json:   path to the Whisper JSON output for this chunk
+  live_md:      path to the .live.md file to append to
+  state_json:   path to the state file (created if missing)
+  chunk_offset: absolute time offset (seconds, may be fractional) where this
+                chunk's start maps to in the full recording. Segment
+                timestamps in chunk_json are relative to chunk start and will
+                be shifted by this amount.
+
+Stdlib only. Matches whisp's stdlib-only Python convention.
+"""
+
+import json
+import sys
+import os
+
+
+# Segments whose absolute start is more than this many seconds BEFORE the
+# previously-emitted end timestamp are dropped as chunk-overlap duplicates.
+# Smaller value = less content loss at chunk boundaries but more duplicates.
+# Larger value = cleaner but more loss. 0.25s is enough to absorb float
+# rounding without dropping legitimate new content.
+OVERLAP_GRACE_SECONDS = 0.25
+
+
+def format_hms(seconds):
+    """Format seconds as HH:MM:SS."""
+    total = int(seconds)
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def load_state(state_path):
+    if not os.path.exists(state_path):
+        return {
+            'last_emitted_end': 0.0,
+            'chunk_count': 0,
+            'total_segments_emitted': 0,
+        }
+    try:
+        with open(state_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        # Corrupt or unreadable — start fresh
+        return {
+            'last_emitted_end': 0.0,
+            'chunk_count': 0,
+            'total_segments_emitted': 0,
+        }
+
+
+def save_state(state_path, state):
+    tmp = state_path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, state_path)
+
+
+def main():
+    if len(sys.argv) != 5:
+        print(
+            f"Usage: {sys.argv[0]} <chunk_json> <live_md> <state_json> <chunk_offset>",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    chunk_json_path = sys.argv[1]
+    live_md_path = sys.argv[2]
+    state_json_path = sys.argv[3]
+    try:
+        chunk_offset = float(sys.argv[4])
+    except ValueError:
+        print(
+            f"Error: chunk_offset must be a number, got: {sys.argv[4]}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not os.path.exists(chunk_json_path):
+        print(f"Error: chunk JSON not found: {chunk_json_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(chunk_json_path) as f:
+            chunk_data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Error: could not read chunk JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    segments = chunk_data.get('segments', [])
+    state = load_state(state_json_path)
+    last_emitted_end = float(state.get('last_emitted_end', 0.0))
+
+    if not segments:
+        # No speech in this chunk — just bump the counter
+        state['chunk_count'] = state.get('chunk_count', 0) + 1
+        save_state(state_json_path, state)
+        return
+
+    # Shift timestamps to absolute, filter overlap with previously-emitted content
+    kept = []
+    for seg in segments:
+        abs_start = float(seg.get('start', 0.0)) + chunk_offset
+        abs_end = float(seg.get('end', 0.0)) + chunk_offset
+        text = seg.get('text', '').strip()
+        if not text:
+            continue
+        # Drop segments whose start is meaningfully before the last emitted end.
+        # These are overlap duplicates — the previous chunk already covered this
+        # time range.
+        if abs_start < last_emitted_end - OVERLAP_GRACE_SECONDS:
+            continue
+        kept.append({
+            'start': abs_start,
+            'end': abs_end,
+            'text': text,
+        })
+
+    if not kept:
+        state['chunk_count'] = state.get('chunk_count', 0) + 1
+        save_state(state_json_path, state)
+        return
+
+    # Append to live.md AND print to stdout simultaneously
+    new_last_end = last_emitted_end
+    with open(live_md_path, 'a') as f:
+        for seg in kept:
+            ts = format_hms(seg['start'])
+            line = f"[{ts}] {seg['text']}"
+            f.write(line + "\n")
+            print(line, flush=True)
+            if seg['end'] > new_last_end:
+                new_last_end = seg['end']
+
+    state['last_emitted_end'] = new_last_end
+    state['chunk_count'] = state.get('chunk_count', 0) + 1
+    state['total_segments_emitted'] = state.get('total_segments_emitted', 0) + len(kept)
+    save_state(state_json_path, state)
+
+
+if __name__ == '__main__':
+    main()

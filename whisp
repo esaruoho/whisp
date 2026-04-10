@@ -10,13 +10,29 @@ NO_MERGE="false"
 FILES=()
 URLS=()
 
+# --- Record subcommand dispatch ---
+# Must happen before general arg parsing so `whisp record ...` never hits the
+# file/URL parser below.
+if [[ $# -gt 0 && "$1" == "record" ]]; then
+  SCRIPT_DIR_EARLY="$(cd "$(dirname "$0")" && pwd)"
+  if [[ ! -x "$SCRIPT_DIR_EARLY/whisp-record" ]]; then
+    echo "Error: $SCRIPT_DIR_EARLY/whisp-record not found or not executable." >&2
+    exit 1
+  fi
+  shift
+  exec "$SCRIPT_DIR_EARLY/whisp-record" "$@"
+fi
+
 is_youtube_url() {
   [[ "$1" =~ ^https?://(www\.)?(youtube\.com/(watch|playlist)|youtu\.be/) ]]
 }
 
 usage() {
   cat <<'USAGE'
-Usage: whisp [OPTIONS] [FILE...] [YOUTUBE_URL...]
+Usage:
+  whisp [OPTIONS] [FILE...] [YOUTUBE_URL...]   Transcribe file(s) or URL(s)
+  whisp record [OPTIONS]                        Live-record + transcribe
+  whisp record --help                           Recording mode help
 
 Transcribe audio/video files using OpenAI Whisper, optionally merging
 with YouTube captions for better proper-noun accuracy.
@@ -51,6 +67,11 @@ Examples:
   # URL only: download audio, transcribe, merge with captions
   whisp https://www.youtube.com/watch?v=ABC123
   whisp --en https://youtu.be/ABC123
+
+  # Live recording: capture mic, live-transcribe, Ctrl+C to stop
+  whisp record
+  whisp record --fi
+  whisp record --out lecture
 USAGE
   exit 0
 }
