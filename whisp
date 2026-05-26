@@ -362,27 +362,36 @@ for idx in "${!FILES[@]}"; do
   fi
   echo ""
 
-  # Auto-detect the best torch device. On Apple Silicon this picks the
-  # Metal GPU (MPS) which is 5-10x faster than CPU for large-v3. CUDA
-  # for Linux/NVIDIA boxes. Falls back to CPU when neither is built/
-  # available. Override with WHISP_DEVICE=cpu in the environment if MPS
-  # gives correctness problems on a specific model.
+  # Detect machine identity and pick the best ML device. On Apple Silicon
+  # this MUST use Metal GPU (MPS) — defaulting to CPU on an M-series Mac is
+  # "doing it the wrong way around" (Esa's words). large-v3 on MPS is ~5-10x
+  # faster than CPU and that's the whole reason for having a Mac.
+  # See: feedback_apple_silicon_first.md in mediabank/memory.
+  # Override with WHISP_DEVICE=cpu if MPS hits a correctness issue.
   if [[ -z "${WHISP_DEVICE:-}" ]]; then
     WHISP_DEVICE="$(python3 - <<'PYEOF'
+import platform, sys
 try:
     import torch
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        print("mps")
-    elif torch.cuda.is_available():
-        print("cuda")
-    else:
-        print("cpu")
 except Exception:
+    print("cpu"); sys.exit(0)
+is_apple_silicon = (platform.system() == "Darwin" and platform.machine() == "arm64")
+if is_apple_silicon and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    print("mps")
+elif torch.cuda.is_available():
+    print("cuda")
+else:
     print("cpu")
 PYEOF
 )"
   fi
-  echo "    Device: $WHISP_DEVICE"
+  # Friendly label for the log
+  case "$WHISP_DEVICE" in
+    mps)  echo "    Device: mps  (Apple Silicon Metal GPU)" ;;
+    cuda) echo "    Device: cuda" ;;
+    cpu)  echo "    Device: cpu  (no MPS/CUDA — inference will be slow)" ;;
+    *)    echo "    Device: $WHISP_DEVICE" ;;
+  esac
 
   WHISPER_ARGS=(
     "$file"
