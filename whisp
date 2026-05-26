@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MODEL="turbo"
+MODEL_EXPLICIT=""    # set to "1" if user passed --model so we don't auto-upgrade
 LANGUAGE=""
 OUTPUT_DIR=""
 CONDITION_ON_PREV="False"
@@ -150,7 +151,7 @@ while [[ $# -gt 0 ]]; do
     --de)               LANGUAGE="de"; shift ;;
     --ru)               LANGUAGE="ru"; shift ;;
     --sv)               LANGUAGE="sv"; shift ;;
-    --model)            MODEL="$2"; shift 2 ;;
+    --model)            MODEL="$2"; MODEL_EXPLICIT="1"; shift 2 ;;
     --out)              OUTPUT_DIR="$2"; shift 2 ;;
     --condition-prev)   CONDITION_ON_PREV="True"; shift ;;
     --no-halluc-filter) HALLUC_SILENCE_THRESH="0"; shift ;;
@@ -167,6 +168,19 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Auto-upgrade model for non-English flags. turbo is fast but degrades on
+# non-English speech (especially Finnish — heavy hallucinations). large-v3
+# is 2.9 GB and ~3x slower but noticeably better. The user can override by
+# passing --model explicitly.
+if [[ -z "$MODEL_EXPLICIT" && -n "$LANGUAGE" ]]; then
+  case "$LANGUAGE" in
+    fi|ru|fa|sv|de)
+      MODEL="large-v3"
+      echo "[whisp] --$LANGUAGE → auto-upgraded model to large-v3 (override with --model turbo)" >&2
+      ;;
+  esac
+fi
 
 if [[ ${#FILES[@]} -eq 0 && ${#URLS[@]} -eq 0 ]]; then
   echo "Error: No input files or URLs specified." >&2
