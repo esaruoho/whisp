@@ -401,6 +401,14 @@ PYEOF
     --condition_on_previous_text "$CONDITION_ON_PREV"
   )
 
+  # On MPS, large-v2/v3 produces NaN tensors mid-transcription with the
+  # default float16 mixed-precision setting (PyTorch MPS precision bug).
+  # Forcing fp32 sidesteps the crash. Slight speed cost vs fp16 but still
+  # 5x+ faster than CPU.
+  if [[ "$WHISP_DEVICE" == "mps" ]]; then
+    WHISPER_ARGS+=(--fp16 False)
+  fi
+
   if [[ -n "$LANGUAGE" ]]; then
     WHISPER_ARGS+=(--language "$LANGUAGE")
   fi
