@@ -370,9 +370,32 @@ for idx in "${!FILES[@]}"; do
   fi
   echo ""
 
+  # Auto-detect the best torch device. On Apple Silicon this picks the
+  # Metal GPU (MPS) which is 5-10x faster than CPU for large-v3. CUDA
+  # for Linux/NVIDIA boxes. Falls back to CPU when neither is built/
+  # available. Override with WHISP_DEVICE=cpu in the environment if MPS
+  # gives correctness problems on a specific model.
+  if [[ -z "${WHISP_DEVICE:-}" ]]; then
+    WHISP_DEVICE="$(python3 - <<'PYEOF'
+try:
+    import torch
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        print("mps")
+    elif torch.cuda.is_available():
+        print("cuda")
+    else:
+        print("cpu")
+except Exception:
+    print("cpu")
+PYEOF
+)"
+  fi
+  echo "    Device: $WHISP_DEVICE"
+
   WHISPER_ARGS=(
     "$file"
     --model "$MODEL"
+    --device "$WHISP_DEVICE"
     --output_format all
     --output_dir "$outdir"
     --condition_on_previous_text "$CONDITION_ON_PREV"
