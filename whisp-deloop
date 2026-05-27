@@ -18,6 +18,40 @@ def normalize(text):
     return re.sub(r'[^a-z0-9 ]', '', text.lower()).strip()
 
 
+# Detects an in-segment hallucination loop: a single text containing the same
+# 5-40-char phrase repeated MIN_INSEGMENT_REPEATS or more times consecutively.
+# This happens when Whisper enters a feedback loop during silence and emits
+# one giant segment full of "se on se, että se on se, että..." (observed
+# 2026-05-27 on Finnish kuulolääkäri / Jukka VR paper / ayurvedic-analysis).
+# Segment-level deloop won't catch these because it's ONE segment.
+MIN_INSEGMENT_REPEATS = 5
+INSEGMENT_LOOP_RE = re.compile(r'(.{5,40}?)\1{' + str(MIN_INSEGMENT_REPEATS - 1) + r',}')
+
+
+def strip_insegment_loops(segments):
+    """Walk segments; for any whose text contains an in-segment hallucination
+    loop, drop the segment entirely (it's noise) and record the removal.
+    Returns (clean_segments, removed_info_list)."""
+    clean = []
+    removed = []
+    for seg in segments:
+        text = seg.get('text', '')
+        m = INSEGMENT_LOOP_RE.search(text)
+        if m and len(m.group(0)) > len(text) * 0.5:
+            # >50% of segment text is the loop → it's hallucination, drop it
+            phrase = m.group(1).strip()
+            count = len(m.group(0)) // max(len(m.group(1)), 1)
+            removed.append({
+                'text': f'(in-segment loop) "{phrase}" x{count}',
+                'count': count,
+                'start': seg.get('start', 0),
+                'end': seg.get('end', 0),
+            })
+        else:
+            clean.append(seg)
+    return clean, removed
+
+
 def detect_and_remove_loops(segments, threshold=3):
     """Remove consecutive runs of repeated segments (threshold or more)."""
     if not segments:
@@ -133,12 +167,22 @@ def main():
     segments = data.get('segments', [])
     original_count = len(segments)
 
-    clean_segments, removed = detect_and_remove_loops(segments, threshold=3)
+    # Pass 1: strip in-segment hallucination loops (single segment containing
+    # "X X X X X..." pattern). Whisper-large-v3-turbo + Finnish + silent
+    # opening generates these. Segment-level dedup misses them.
+    segments_after_insegment, insegment_removed = strip_insegment_loops(segments)
 
-    if not removed:
+    # Pass 2: traditional consecutive-segment dedup
+    clean_segments, removed = detect_and_remove_loops(segments_after_insegment, threshold=3)
+
+    all_removed = insegment_removed + removed
+    if not all_removed:
         print("  No hallucination loops detected.")
         return
 
+    for r in insegment_removed:
+        print(f"  Removed {r['text']} "
+              f"({format_ts_vtt(r['start'])} -> {format_ts_vtt(r['end'])})")
     for r in removed:
         print(f"  Removed {r['count']}x \"{r['text']}\" "
               f"({format_ts_vtt(r['start'])} -> {format_ts_vtt(r['end'])})")
