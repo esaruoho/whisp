@@ -486,9 +486,18 @@ PYEOF
       *)                     MLX_MODEL=mlx-community/whisper-large-v3-turbo ;;
     esac
 
-    MLX_ARGS=("$file" --model "$MLX_MODEL" --output-format all --output-dir "$outdir")
+    MLX_ARGS=(
+      "$file"
+      --model "$MLX_MODEL"
+      --output-format all
+      --output-dir "$outdir"
+      # Always pass condition-on-previous-text — mlx-whisper defaults to True
+      # which causes hallucination loops ("se on se, että se on se, että..."
+      # in Finnish, observed 2026-05-27). whisp's CONDITION_ON_PREV defaults
+      # to "False" which is what we want.
+      --condition-on-previous-text "$CONDITION_ON_PREV"
+    )
     [[ -n "$LANGUAGE" ]] && MLX_ARGS+=(--language "$LANGUAGE")
-    [[ "$CONDITION_ON_PREV" == "False" ]] && MLX_ARGS+=(--condition-on-previous-text False)
     if [[ "$HALLUC_SILENCE_THRESH" != "0" ]]; then
       MLX_ARGS+=(--hallucination-silence-threshold "$HALLUC_SILENCE_THRESH")
     fi
