@@ -461,14 +461,59 @@ PYEOF
     echo ""
   fi
 
-  if ! whisper "${WHISPER_ARGS[@]}"; then
-    echo "Error: Whisper failed to transcribe: $file" >&2
-    # Clean up background job if running
-    if [[ -n "$yt_captions_pid" ]]; then
-      kill "$yt_captions_pid" 2>/dev/null || true
-      wait "$yt_captions_pid" 2>/dev/null || true
+  # === Engine dispatch (added 2026-05-27) ===
+  # Prefer mlx-whisper on Apple Silicon: ~3x less memory, ~3x faster.
+  # Detection via apple-report --json — `hardware.chip` startswith "Apple" on M-series.
+  # Falls through to openai-whisper if: not Apple Silicon, mlx_whisper not in PATH,
+  # or apple-report missing. Both engines produce the same output formats so the
+  # downstream deloop / merge steps don't need to care which ran.
+  USE_MLX=0
+  if command -v apple-report >/dev/null 2>&1 && command -v mlx_whisper >/dev/null 2>&1; then
+    if apple-report --json 2>/dev/null | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("hardware",{}).get("chip","").startswith("Apple") else 1)' 2>/dev/null; then
+      USE_MLX=1
     fi
-    continue
+  fi
+
+  if [[ "$USE_MLX" == "1" ]]; then
+    # Translate openai-whisper model name → mlx-community HuggingFace path
+    case "$MODEL" in
+      tiny)                  MLX_MODEL=mlx-community/whisper-tiny-mlx ;;
+      base)                  MLX_MODEL=mlx-community/whisper-base-mlx ;;
+      small)                 MLX_MODEL=mlx-community/whisper-small-mlx ;;
+      medium)                MLX_MODEL=mlx-community/whisper-medium-mlx ;;
+      large-v3)              MLX_MODEL=mlx-community/whisper-large-v3-mlx ;;
+      turbo|large-v3-turbo)  MLX_MODEL=mlx-community/whisper-large-v3-turbo ;;
+      *)                     MLX_MODEL=mlx-community/whisper-large-v3-turbo ;;
+    esac
+
+    MLX_ARGS=("$file" --model "$MLX_MODEL" --output-format all --output-dir "$outdir")
+    [[ -n "$LANGUAGE" ]] && MLX_ARGS+=(--language "$LANGUAGE")
+    [[ "$CONDITION_ON_PREV" == "False" ]] && MLX_ARGS+=(--condition-on-previous-text False)
+    if [[ "$HALLUC_SILENCE_THRESH" != "0" ]]; then
+      MLX_ARGS+=(--hallucination-silence-threshold "$HALLUC_SILENCE_THRESH")
+    fi
+    [[ -n "$paired_url" ]] && MLX_ARGS+=(--word-timestamps True)
+
+    echo "    Engine: mlx-whisper ($MLX_MODEL)"
+
+    if ! mlx_whisper "${MLX_ARGS[@]}"; then
+      echo "Error: mlx-whisper failed to transcribe: $file" >&2
+      if [[ -n "$yt_captions_pid" ]]; then
+        kill "$yt_captions_pid" 2>/dev/null || true
+        wait "$yt_captions_pid" 2>/dev/null || true
+      fi
+      continue
+    fi
+  else
+    echo "    Engine: openai-whisper ($MODEL)"
+    if ! whisper "${WHISPER_ARGS[@]}"; then
+      echo "Error: Whisper failed to transcribe: $file" >&2
+      if [[ -n "$yt_captions_pid" ]]; then
+        kill "$yt_captions_pid" 2>/dev/null || true
+        wait "$yt_captions_pid" 2>/dev/null || true
+      fi
+      continue
+    fi
   fi
 
   basename="${file##*/}"
