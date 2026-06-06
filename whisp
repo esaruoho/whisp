@@ -501,7 +501,11 @@ PYEOF
     if [[ "$HALLUC_SILENCE_THRESH" != "0" ]]; then
       MLX_ARGS+=(--hallucination-silence-threshold "$HALLUC_SILENCE_THRESH")
     fi
-    [[ -n "$paired_url" ]] && MLX_ARGS+=(--word-timestamps True)
+    # Always emit word timestamps: downstream tools (sentence/word chopping,
+    # voice isolation) need per-word timing, and a local-file transcript must be
+    # just as choppable as a paired-URL one. (Previously gated to paired_url,
+    # which silently produced word-less JSON for local files.)
+    MLX_ARGS+=(--word-timestamps True)
 
     echo "    Engine: mlx-whisper ($MLX_MODEL)"
 
