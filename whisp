@@ -5,6 +5,8 @@ MODEL="large-v3"
 MODEL_EXPLICIT=""    # set to "1" if user passed --model so we don't override
 LANGUAGE=""
 OUTPUT_DIR=""
+SOURCE_URL=""        # --source-url: original URL → metadata.url (so the Discord embed links it)
+META_TITLE=""        # --title: clean title → metadata.title (instead of the bare filename)
 CONDITION_ON_PREV="False"
 HALLUC_SILENCE_THRESH="2"
 NO_MERGE="false"
@@ -151,8 +153,11 @@ while [[ $# -gt 0 ]]; do
     --de)               LANGUAGE="de"; shift ;;
     --ru)               LANGUAGE="ru"; shift ;;
     --sv)               LANGUAGE="sv"; shift ;;
+    --language)         LANGUAGE="$2"; shift 2 ;;
     --model)            MODEL="$2"; MODEL_EXPLICIT="1"; shift 2 ;;
     --out)              OUTPUT_DIR="$2"; shift 2 ;;
+    --source-url)       SOURCE_URL="$2"; shift 2 ;;
+    --title)            META_TITLE="$2"; shift 2 ;;
     --condition-prev)   CONDITION_ON_PREV="True"; shift ;;
     --no-halluc-filter) HALLUC_SILENCE_THRESH="0"; shift ;;
     --no-merge)         NO_MERGE="true"; shift ;;
@@ -624,14 +629,16 @@ if [[ -d "$TRANSCRIPTS_REPO/.git" ]]; then
 
     # Generate metadata
     duration_secs=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null | cut -d. -f1 || echo "0")
+    meta_title="${META_TITLE:-$basename}"
     cat > "$transcript_dir/metadata.yaml" <<METAEOF
-title: "$(echo "$basename" | sed 's/"/\\"/g')"
+title: "$(echo "$meta_title" | sed 's/"/\\"/g')"
 source_file: "$(basename "$file")"
 duration_seconds: ${duration_secs:-0}
 whisper_model: $MODEL
 language: ${LANGUAGE:-auto}
 transcribed_date: "$today"
-source: local
+source: $([ -n "$SOURCE_URL" ] && echo "youtube" || echo "local")
+url: "$SOURCE_URL"
 
 concepts: []
 people: []
