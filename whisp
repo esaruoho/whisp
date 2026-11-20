@@ -514,7 +514,25 @@ PYEOF
 
     echo "    Engine: mlx-whisper ($MLX_MODEL)"
 
-    if ! mlx_whisper "${MLX_ARGS[@]}"; then
+    # MEMORY CAP (2026-11-20): bare mlx_whisper lets MLX's Metal buffer cache grow without bound —
+    # a 2h1080p video with word timestamps hit a 24 GB footprint on the 32 GB Mini, pushed 24 GB to
+    # swap and starved the MLX/Qwen mail brain + OCR. Run the same CLI through its own interpreter
+    # with MLX limits set first. WHISP_MLX_MEM_GB=0 disables the caps.
+    MLX_PY=$(head -1 "$(command -v mlx_whisper)" | sed 's/^#!//')
+    WHISP_MLX_MEM_GB="${WHISP_MLX_MEM_GB:-8}" WHISP_MLX_CACHE_GB="${WHISP_MLX_CACHE_GB:-1}"
+    export WHISP_MLX_MEM_GB WHISP_MLX_CACHE_GB
+    # shellcheck disable=SC2086  # $MLX_PY may be "/usr/bin/env python3"
+    if ! $MLX_PY -c '
+import os, sys
+import mlx.core as mx
+mem = float(os.environ.get("WHISP_MLX_MEM_GB", "8"))
+if mem > 0:
+    mx.set_memory_limit(int(mem * 2**30))
+    mx.set_cache_limit(int(float(os.environ.get("WHISP_MLX_CACHE_GB", "1")) * 2**30))
+from mlx_whisper.cli import main
+sys.argv[0] = "mlx_whisper"
+sys.exit(main())
+' "${MLX_ARGS[@]}"; then
       echo "Error: mlx-whisper failed to transcribe: $file" >&2
       if [[ -n "$yt_captions_pid" ]]; then
         kill "$yt_captions_pid" 2>/dev/null || true
